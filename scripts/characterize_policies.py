@@ -12,7 +12,7 @@ import numpy as np
 import pybullet as p
 from stable_baselines3 import PPO
 
-from envs.quadruped_env import QuadrupedFaultEnv
+from envs.quadruped_env import make_env_from_model_path
 
 GRAVITY = 9.81
 
@@ -201,7 +201,7 @@ def main():
             continue
 
         model = PPO.load(model_path)
-        env = QuadrupedFaultEnv(render=False)
+        env = make_env_from_model_path(model_path, render=False)
         mass = total_mass(env)
         feet = foot_link_indices(env)
 
@@ -228,7 +228,7 @@ def main():
         print("No seeds characterized.")
         return
 
-    # across-seed summary 
+    # ---- across-seed summary ----
     print("\n" + "=" * 78)
     print(f"BASE POLICY CHARACTERIZATION -- across {len(per_seed)} converged seeds")
     print("=" * 78)

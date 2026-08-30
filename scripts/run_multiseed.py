@@ -13,21 +13,24 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
-               n_episodes=5, survival_threshold=0.8):
+               n_episodes=5, survival_threshold=0.8, init_noise=0.05):
     import pybullet as p
     from stable_baselines3 import PPO
     from envs.quadruped_env import QuadrupedFaultEnv
 
     model = PPO.load(model_path)
-    env = QuadrupedFaultEnv(render=False)
+    # Without init noise every "episode" here is identical, making the multi-episode survival rate a single measurement repeated n times.
+    env = QuadrupedFaultEnv(render=False, init_noise_scale=init_noise)
 
     ep_survived, ep_speeds, ep_steps, ep_ranges, ep_contact_var = [], [], [], [], []
+    ep_net_speeds, ep_lat, ep_yaw = [], [], []
 
     for episode in range(n_episodes):
         obs, info = env.reset(seed=episode)
         start_pos = np.array(p.getBasePositionAndOrientation(
             env.robot_id, physicsClientId=env._client)[0])
         joint_history, contact_counts = [], []
+        fwd_vels, lat_vels, yaw_rates = [], [], []
 
         for step in range(steps):
             action, _ = model.predict(obs, deterministic=True)
@@ -38,6 +41,9 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
             ])
             contact_counts.append(len(p.getContactPoints(
                 env.robot_id, env.plane_id, physicsClientId=env._client)))
+            fwd_vels.append(info.get("forward_vel", 0.0))
+            lat_vels.append(info.get("lateral_vel", 0.0))
+            yaw_rates.append(info.get("yaw_rate", 0.0))
             if terminated or truncated:
                 break
 
@@ -50,7 +56,11 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
 
         ep_steps.append(steps_survived)
         ep_survived.append(steps_survived >= 0.9 * steps)
-        ep_speeds.append(displacement / elapsed if elapsed > 0 else 0.0)
+        # Judge tracking on FORWARD velocity in the body frame, not net displacement
+        ep_speeds.append(float(np.mean(fwd_vels)) if fwd_vels else 0.0)
+        ep_net_speeds.append(displacement / elapsed if elapsed > 0 else 0.0)
+        ep_lat.append(float(np.mean(np.abs(lat_vels))) if lat_vels else 0.0)
+        ep_yaw.append(float(np.mean(np.abs(yaw_rates))) if yaw_rates else 0.0)
         jh = np.array(joint_history)
         ep_ranges.append(float((jh.max(axis=0) - jh.min(axis=0)).mean()) if len(jh) else 0.0)
         ep_contact_var.append(
@@ -60,7 +70,7 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
 
     survival_rate = sum(ep_survived) / len(ep_survived)
 
-    # Speed is only meaningful on episodes that ran to completion 
+    # Speed is only meaningful on episodes that ran to completion
     full_speeds = [sp for sp, ok in zip(ep_speeds, ep_survived) if ok]
     mean_speed = float(np.mean(full_speeds)) if full_speeds else float(np.mean(ep_speeds))
     speed_sd = float(np.std(full_speeds, ddof=1)) if len(full_speeds) > 1 else 0.0
@@ -92,6 +102,9 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
         "steps_survived_per_episode": [int(x) for x in ep_steps],
         "fell": bool(not all(ep_survived)),
         "mean_speed_mps": round(mean_speed, 4),
+        "mean_net_speed_mps": round(float(np.mean(ep_net_speeds)), 4) if ep_net_speeds else 0.0,
+        "mean_abs_lateral_vel": round(float(np.mean(ep_lat)), 4) if ep_lat else 0.0,
+        "mean_abs_yaw_rate": round(float(np.mean(ep_yaw)), 4) if ep_yaw else 0.0,
         "speed_sd_mps": round(speed_sd, 4),
         "mean_joint_range_rad": round(float(np.mean(ep_ranges)), 4),
         "contact_variation": round(float(np.mean(ep_contact_var)), 4),
@@ -117,7 +130,7 @@ def main():
                         help="Evaluate existing policies without retraining")
     parser.add_argument("--gait_steps", type=int, default=1000)
     parser.add_argument("--target_velocity", type=float, default=0.5,
-                        help="Commanded velocity the base policy was trained to track.")
+                        help="Commanded FORWARD velocity (vx) the policy tracks.")
     parser.add_argument("--convergence_tol", type=float, default=0.30,
                         help="A seed counts as converged only if it survives the episode AND "
                              "tracks the commanded velocity within this fraction. The old "
@@ -129,6 +142,9 @@ def main():
                              "convergence rate an n=1 measurement per seed.")
     parser.add_argument("--survival_threshold", type=float, default=0.8,
                         help="Fraction of gait-check episodes a policy must survive.")
+    parser.add_argument("--init_noise", type=float, default=0.05,
+                        help="Initial joint-angle perturbation (rad) used during EVALUATION "
+                             "so repeated episodes/trials are genuinely independent.")
     parser.add_argument("--force_retrain", action="store_true",
                         help="Retrain even if a model already exists at the target path.")
     parser.add_argument("--log_format", type=str, default="csv",
@@ -212,7 +228,8 @@ def main():
                               target_velocity=args.target_velocity,
                               tol=args.convergence_tol,
                               n_episodes=args.gait_episodes,
-                              survival_threshold=args.survival_threshold)
+                              survival_threshold=args.survival_threshold,
+                              init_noise=args.init_noise)
         except Exception as exc:
             print(f"[seed {seed}] gait check errored: {exc}")
             manifest["seeds"][str(seed)] = {"status": "gait_check_failed", "error": str(exc)}
@@ -220,15 +237,17 @@ def main():
 
         status = "converged" if gait["converged"] else "NOT converged"
         detail = f" [{gait['failure_mode']}]" if gait['failure_mode'] else ""
-        print(f"[seed {seed}] {status}{detail}: {gait['mean_speed_mps']} +/- "
-              f"{gait['speed_sd_mps']} m/s (tracking error {gait['tracking_error']:.0%} "
-              f"vs {args.target_velocity} m/s), survived {gait['survival_rate']:.0%} of "
-              f"{gait['n_episodes']} episodes, steps {gait['steps_survived_per_episode']}")
+        print(f"[seed {seed}] {status}{detail}: fwd={gait['mean_speed_mps']} +/- "
+              f"{gait['speed_sd_mps']} m/s (err {gait['tracking_error']:.0%} vs "
+              f"{args.target_velocity}), net={gait.get('mean_net_speed_mps')} m/s, "
+              f"lat={gait.get('mean_abs_lateral_vel')} m/s, "
+              f"yaw={gait.get('mean_abs_yaw_rate')} rad/s, "
+              f"survived {gait['survival_rate']:.0%} of {gait['n_episodes']} eps")
 
         manifest["seeds"][str(seed)] = {"status": "ok", "gait": gait,
                                         "model_path": model_path + ".zip"}
 
-        # A non-converged seed is a REPORTABLE RESULT, not a failure to hide
+        # A non-converged seed is a REPORTABLE RESULT, not a failure of the experiment. It is still useful to know how the policy responds to faults, but it is not comparable to a policy that actually learned to walk.
         if not gait["converged"]:
             print(f"[seed {seed}] skipping fault evaluation -- policy did not learn to walk. "
                   f"This counts toward the reported convergence rate.")
@@ -241,6 +260,7 @@ def main():
         ok = run([sys.executable, "scripts/baseline_fault_eval.py",
                   "--model", model_path,
                   "--trials", str(args.trials),
+                  "--init_noise", str(args.init_noise),
                   "--out", out_csv])
         manifest["seeds"][str(seed)]["baseline_csv"] = out_csv if ok else None
 
