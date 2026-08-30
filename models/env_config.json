@@ -1,0 +1,12 @@
+{
+  "command_vel": [
+    0.5,
+    0.0,
+    0.0
+  ],
+  "max_episode_steps": 1000,
+  "action_repeat": 4,
+  "max_torque": 20.0,
+  "action_scale": 0.5,
+  "randomize_init": true
+}
