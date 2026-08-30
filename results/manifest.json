@@ -1,0 +1,321 @@
+{
+  "config": {
+    "seeds": 10,
+    "timesteps": 1500000,
+    "n_envs": 4,
+    "ent_coef": 0.01,
+    "trials": 100,
+    "results_dir": "results",
+    "models_dir": "models",
+    "skip_training": true,
+    "gait_steps": 1000,
+    "target_velocity": 0.5,
+    "convergence_tol": 0.3,
+    "gait_episodes": 5,
+    "survival_threshold": 0.8,
+    "force_retrain": false,
+    "log_format": "csv"
+  },
+  "seeds": {
+    "0": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.059,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5295,
+        "mean_net_speed_mps": 0.5199,
+        "mean_abs_lateral_vel": 0.0904,
+        "mean_abs_yaw_rate": 0.251,
+        "speed_sd_mps": 0.0155,
+        "mean_joint_range_rad": 0.6423,
+        "contact_variation": 0.6539
+      },
+      "model_path": "models\\seed_0.zip",
+      "baseline_csv": "results\\seed_0\\baseline_fault_results.csv"
+    },
+    "1": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.1381,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5691,
+        "mean_net_speed_mps": 0.5678,
+        "mean_abs_lateral_vel": 0.0871,
+        "mean_abs_yaw_rate": 0.2518,
+        "speed_sd_mps": 0.0178,
+        "mean_joint_range_rad": 0.6627,
+        "contact_variation": 0.6392
+      },
+      "model_path": "models\\seed_1.zip",
+      "baseline_csv": "results\\seed_1\\baseline_fault_results.csv"
+    },
+    "2": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.1799,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5899,
+        "mean_net_speed_mps": 0.572,
+        "mean_abs_lateral_vel": 0.0918,
+        "mean_abs_yaw_rate": 0.2643,
+        "speed_sd_mps": 0.0248,
+        "mean_joint_range_rad": 0.6664,
+        "contact_variation": 0.6729
+      },
+      "model_path": "models\\seed_2.zip",
+      "baseline_csv": "results\\seed_2\\baseline_fault_results.csv"
+    },
+    "3": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.1434,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5717,
+        "mean_net_speed_mps": 0.5704,
+        "mean_abs_lateral_vel": 0.0874,
+        "mean_abs_yaw_rate": 0.242,
+        "speed_sd_mps": 0.0216,
+        "mean_joint_range_rad": 0.621,
+        "contact_variation": 0.7097
+      },
+      "model_path": "models\\seed_3.zip",
+      "baseline_csv": "results\\seed_3\\baseline_fault_results.csv"
+    },
+    "4": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.1724,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5862,
+        "mean_net_speed_mps": 0.5832,
+        "mean_abs_lateral_vel": 0.0927,
+        "mean_abs_yaw_rate": 0.2591,
+        "speed_sd_mps": 0.0241,
+        "mean_joint_range_rad": 0.6806,
+        "contact_variation": 0.6308
+      },
+      "model_path": "models\\seed_4.zip",
+      "baseline_csv": "results\\seed_4\\baseline_fault_results.csv"
+    },
+    "5": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.0389,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5195,
+        "mean_net_speed_mps": 0.518,
+        "mean_abs_lateral_vel": 0.0985,
+        "mean_abs_yaw_rate": 0.2474,
+        "speed_sd_mps": 0.0036,
+        "mean_joint_range_rad": 0.7066,
+        "contact_variation": 0.5604
+      },
+      "model_path": "models\\seed_5.zip",
+      "baseline_csv": "results\\seed_5\\baseline_fault_results.csv"
+    },
+    "6": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.0985,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5492,
+        "mean_net_speed_mps": 0.5067,
+        "mean_abs_lateral_vel": 0.0807,
+        "mean_abs_yaw_rate": 0.2558,
+        "speed_sd_mps": 0.0062,
+        "mean_joint_range_rad": 0.5857,
+        "contact_variation": 0.6879
+      },
+      "model_path": "models\\seed_6.zip",
+      "baseline_csv": "results\\seed_6\\baseline_fault_results.csv"
+    },
+    "7": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 0.8,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.088,
+        "steps_survived": 873,
+        "steps_survived_per_episode": [
+          1000,
+          455,
+          1000,
+          1000,
+          914
+        ],
+        "fell": true,
+        "mean_speed_mps": 0.456,
+        "mean_net_speed_mps": 0.4408,
+        "mean_abs_lateral_vel": 0.0728,
+        "mean_abs_yaw_rate": 0.2149,
+        "speed_sd_mps": 0.0256,
+        "mean_joint_range_rad": 0.6358,
+        "contact_variation": 0.6656
+      },
+      "model_path": "models\\seed_7.zip",
+      "baseline_csv": "results\\seed_7\\baseline_fault_results.csv"
+    },
+    "8": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 0.8,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.0699,
+        "steps_survived": 939,
+        "steps_survived_per_episode": [
+          698,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": true,
+        "mean_speed_mps": 0.535,
+        "mean_net_speed_mps": 0.4969,
+        "mean_abs_lateral_vel": 0.0876,
+        "mean_abs_yaw_rate": 0.2536,
+        "speed_sd_mps": 0.0178,
+        "mean_joint_range_rad": 0.6666,
+        "contact_variation": 0.6574
+      },
+      "model_path": "models\\seed_8.zip",
+      "baseline_csv": "results\\seed_8\\baseline_fault_results.csv"
+    },
+    "9": {
+      "status": "ok",
+      "gait": {
+        "converged": true,
+        "failure_mode": "",
+        "n_episodes": 5,
+        "survival_rate": 1.0,
+        "stable": true,
+        "on_target": true,
+        "tracking_error": 0.0713,
+        "steps_survived": 1000,
+        "steps_survived_per_episode": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "fell": false,
+        "mean_speed_mps": 0.5356,
+        "mean_net_speed_mps": 0.5332,
+        "mean_abs_lateral_vel": 0.0816,
+        "mean_abs_yaw_rate": 0.2304,
+        "speed_sd_mps": 0.0099,
+        "mean_joint_range_rad": 0.5837,
+        "contact_variation": 0.6891
+      },
+      "model_path": "models\\seed_9.zip",
+      "baseline_csv": "results\\seed_9\\baseline_fault_results.csv"
+    }
+  }
+}
