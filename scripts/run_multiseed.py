@@ -4,34 +4,36 @@ import os
 import subprocess
 import sys
 import time
-
+ 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+ 
 import numpy as np
-
+ 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
-               n_episodes=5, survival_threshold=0.8, init_noise=0.05):
+ 
+ 
+def gait_check(model_path, steps=1000, target_velocity=None, tol=0.30,
+               n_episodes=5, survival_threshold=0.8):
     import pybullet as p
     from stable_baselines3 import PPO
-    from envs.quadruped_env import QuadrupedFaultEnv
-
+    from envs.quadruped_env import make_env_from_model_path
+ 
     model = PPO.load(model_path)
-    # Without init noise every "episode" here is identical, making the multi-episode survival rate a single measurement repeated n times.
-    env = QuadrupedFaultEnv(render=False, init_noise_scale=init_noise)
-
+    # Build from the config saved beside the model, so the evaluation env always matches the one the policy trained in
+    # Take the commanded forward velocity from the env unless overridden, so the convergence criterion cannot silently diverge from what was trained.
+    if target_velocity is None:
+        target_velocity = float(env.command_vel[0])
+ 
     ep_survived, ep_speeds, ep_steps, ep_ranges, ep_contact_var = [], [], [], [], []
     ep_net_speeds, ep_lat, ep_yaw = [], [], []
-
+ 
     for episode in range(n_episodes):
         obs, info = env.reset(seed=episode)
         start_pos = np.array(p.getBasePositionAndOrientation(
             env.robot_id, physicsClientId=env._client)[0])
         joint_history, contact_counts = [], []
         fwd_vels, lat_vels, yaw_rates = [], [], []
-
+ 
         for step in range(steps):
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -46,14 +48,14 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
             yaw_rates.append(info.get("yaw_rate", 0.0))
             if terminated or truncated:
                 break
-
+ 
         end_pos = np.array(p.getBasePositionAndOrientation(
             env.robot_id, physicsClientId=env._client)[0])
-
+ 
         steps_survived = step + 1
         elapsed = steps_survived * 4 / 240.0      # action_repeat=4, 240 Hz physics
         displacement = float(np.linalg.norm(end_pos - start_pos))
-
+ 
         ep_steps.append(steps_survived)
         ep_survived.append(steps_survived >= 0.9 * steps)
         # Judge tracking on FORWARD velocity in the body frame, not net displacement
@@ -65,22 +67,22 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
         ep_ranges.append(float((jh.max(axis=0) - jh.min(axis=0)).mean()) if len(jh) else 0.0)
         ep_contact_var.append(
             float(np.mean(np.diff(contact_counts) != 0)) if len(contact_counts) > 1 else 0.0)
-
+ 
     env.close()
-
+ 
     survival_rate = sum(ep_survived) / len(ep_survived)
-
+ 
     # Speed is only meaningful on episodes that ran to completion
     full_speeds = [sp for sp, ok in zip(ep_speeds, ep_survived) if ok]
     mean_speed = float(np.mean(full_speeds)) if full_speeds else float(np.mean(ep_speeds))
     speed_sd = float(np.std(full_speeds, ddof=1)) if len(full_speeds) > 1 else 0.0
-
+ 
     tracking_error = abs(mean_speed - target_velocity) / target_velocity if target_velocity else 1.0
-
+ 
     stable = survival_rate >= survival_threshold
     on_target = tracking_error <= tol
     converged = stable and on_target
-
+ 
     if converged:
         failure_mode = ""
     elif not stable and not on_target:
@@ -89,7 +91,7 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
         failure_mode = "unstable"
     else:
         failure_mode = "off_target"
-
+ 
     return {
         "converged": bool(converged),
         "failure_mode": failure_mode,
@@ -109,14 +111,14 @@ def gait_check(model_path, steps=1000, target_velocity=0.5, tol=0.30,
         "mean_joint_range_rad": round(float(np.mean(ep_ranges)), 4),
         "contact_variation": round(float(np.mean(ep_contact_var)), 4),
     }
-
-
+ 
+ 
 def run(cmd):
     print(f"\n$ {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, cwd=PROJECT_ROOT)
     return result.returncode == 0
-
-
+ 
+ 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, default=5, help="Number of seeds (0..N-1)")
@@ -142,16 +144,14 @@ def main():
                              "convergence rate an n=1 measurement per seed.")
     parser.add_argument("--survival_threshold", type=float, default=0.8,
                         help="Fraction of gait-check episodes a policy must survive.")
-    parser.add_argument("--init_noise", type=float, default=0.05,
-                        help="Initial joint-angle perturbation (rad) used during EVALUATION "
-                             "so repeated episodes/trials are genuinely independent.")
+    # Initial-state randomization is an ENVIRONMENT setting now (randomize_init)
     parser.add_argument("--force_retrain", action="store_true",
                         help="Retrain even if a model already exists at the target path.")
     parser.add_argument("--log_format", type=str, default="csv",
                         choices=["csv", "tensorboard", "none"],
                         help="Passed through to training. csv is the robust default.")
     args = parser.parse_args()
-
+ 
     os.makedirs(args.results_dir, exist_ok=True)
     manifest_path = os.path.join(args.results_dir, "manifest.json")
     manifest = {"config": vars(args), "seeds": {}}
@@ -162,18 +162,18 @@ def main():
             manifest["config"] = vars(args)
         except json.JSONDecodeError:
             pass
-
+ 
     started = time.time()
-
+ 
     for seed in range(args.seeds):
         print("\n" + "=" * 70)
         print(f"SEED {seed} / {args.seeds - 1}")
         print("=" * 70)
-
+ 
         model_path = os.path.join(args.models_dir, f"seed_{seed}")
         seed_results_dir = os.path.join(args.results_dir, f"seed_{seed}")
         os.makedirs(seed_results_dir, exist_ok=True)
-
+ 
         # train 
         if not args.skip_training:
             existing_cfg_path = model_path + "_trainconfig.json"
@@ -198,7 +198,7 @@ def main():
                     stale = True
                     print(f"[seed {seed}] existing model has no _trainconfig.json -- provenance "
                           f"unknown, so it cannot be trusted to match this batch. Retraining.")
-
+ 
             if os.path.exists(model_path + ".zip") and not stale and not args.force_retrain:
                 print(f"[seed {seed}] {model_path}.zip already exists with matching settings "
                       f"-- skipping training.")
@@ -215,12 +215,12 @@ def main():
                     print(f"[seed {seed}] TRAINING FAILED -- skipping this seed")
                     manifest["seeds"][str(seed)] = {"status": "train_failed"}
                     continue
-
+ 
         if not os.path.exists(model_path + ".zip"):
             print(f"[seed {seed}] no model at {model_path}.zip -- skipping")
             manifest["seeds"][str(seed)] = {"status": "missing_model"}
             continue
-
+ 
         # gait check 
         print(f"\n[seed {seed}] checking whether the policy walks...")
         try:
@@ -228,13 +228,12 @@ def main():
                               target_velocity=args.target_velocity,
                               tol=args.convergence_tol,
                               n_episodes=args.gait_episodes,
-                              survival_threshold=args.survival_threshold,
-                              init_noise=args.init_noise)
+                              survival_threshold=args.survival_threshold)
         except Exception as exc:
             print(f"[seed {seed}] gait check errored: {exc}")
             manifest["seeds"][str(seed)] = {"status": "gait_check_failed", "error": str(exc)}
             continue
-
+ 
         status = "converged" if gait["converged"] else "NOT converged"
         detail = f" [{gait['failure_mode']}]" if gait['failure_mode'] else ""
         print(f"[seed {seed}] {status}{detail}: fwd={gait['mean_speed_mps']} +/- "
@@ -243,35 +242,34 @@ def main():
               f"lat={gait.get('mean_abs_lateral_vel')} m/s, "
               f"yaw={gait.get('mean_abs_yaw_rate')} rad/s, "
               f"survived {gait['survival_rate']:.0%} of {gait['n_episodes']} eps")
-
+ 
         manifest["seeds"][str(seed)] = {"status": "ok", "gait": gait,
                                         "model_path": model_path + ".zip"}
-
-        # A non-converged seed is a REPORTABLE RESULT, not a failure of the experiment. It is still useful to know how the policy responds to faults, but it is not comparable to a policy that actually learned to walk.
+ 
+        # A non-converged seed is a REPORTABLE RESULT
         if not gait["converged"]:
             print(f"[seed {seed}] skipping fault evaluation -- policy did not learn to walk. "
                   f"This counts toward the reported convergence rate.")
             with open(manifest_path, "w") as f:
                 json.dump(manifest, f, indent=2)
             continue
-
+ 
         # fault evaluation 
         out_csv = os.path.join(seed_results_dir, "baseline_fault_results.csv")
         ok = run([sys.executable, "scripts/baseline_fault_eval.py",
                   "--model", model_path,
                   "--trials", str(args.trials),
-                  "--init_noise", str(args.init_noise),
                   "--out", out_csv])
         manifest["seeds"][str(seed)]["baseline_csv"] = out_csv if ok else None
-
+ 
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
-
+ 
     # summary 
     elapsed_min = (time.time() - started) / 60.0
     ok_seeds = [s for s, v in manifest["seeds"].items() if v.get("status") == "ok"]
     converged = [s for s in ok_seeds if manifest["seeds"][s]["gait"]["converged"]]
-
+ 
     print("\n" + "=" * 70)
     print(f"DONE in {elapsed_min:.1f} min")
     print(f"Seeds run: {len(ok_seeds)} | converged to a walking gait: "
@@ -283,7 +281,7 @@ def main():
                   f"{np.std(speeds, ddof=1) if len(speeds) > 1 else 0.0:.3f} m/s")
     print(f"Manifest: {manifest_path}")
     print("\nNext: python scripts/aggregate_seeds.py")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
