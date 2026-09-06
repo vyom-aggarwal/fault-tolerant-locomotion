@@ -7,6 +7,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import pybullet as p
 from stable_baselines3 import PPO
 
 from envs.quadruped_env import make_env_from_model_path
@@ -44,7 +45,6 @@ def collect(model, env, steps, dither, rng, hold=120, settle=60):
 
 
 def fit(deltas, ys, w=SMOOTH_WINDOW, lag=RESPONSE_LAG):
-    """Least-squares fit of y_smooth = B @ delta_window + y0. Returns B, y0, R^2."""
     X, Y = [], []
     for t in range(w + lag, len(ys)):
         Y.append(np.mean(ys[t - w + 1:t + 1], axis=0))
