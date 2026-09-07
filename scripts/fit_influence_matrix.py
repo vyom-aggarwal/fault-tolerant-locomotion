@@ -17,7 +17,8 @@ RESPONSE_LAG = 3       # must match ResidualAdapter.response_lag
 
 
 def collect(model, env, steps, dither, rng, hold=120, settle=60):
-    obs, info = env.reset()
+    episode = 0
+    obs, info = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
     deltas, ys = [], []
     n_act = env.action_space.shape[0]
     current = rng.normal(0.0, dither, size=n_act)
@@ -30,7 +31,8 @@ def collect(model, env, steps, dither, rng, hold=120, settle=60):
         deltas.append(d)
         ys.append([info["forward_vel"], info["lateral_vel"], info["yaw_rate"]])
         if term or trunc:
-            obs, info = env.reset()
+            episode += 1
+            obs, info = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
             # drop the transient after a reset rather than regressing across it
             for _ in range(settle):
                 base, _ = model.predict(obs, deterministic=True)
@@ -39,7 +41,8 @@ def collect(model, env, steps, dither, rng, hold=120, settle=60):
                 deltas.append(d2)
                 ys.append([info["forward_vel"], info["lateral_vel"], info["yaw_rate"]])
                 if term2 or trunc2:
-                    obs, info = env.reset()
+                    episode += 1
+                    obs, info = env.reset(seed=int(rng.integers(0, 2**31 - 1)))
                     break
     return np.array(deltas), np.array(ys)
 
@@ -64,26 +67,57 @@ def fit(deltas, ys, w=SMOOTH_WINDOW, lag=RESPONSE_LAG):
     return B, y0, r2, len(X)
 
 
-def process(model_path, steps, dither, seed, hold=120):
+def split_half_agreement(deltas, ys):
+    n = len(ys)
+    mid = n // 2
+    B1, _, _, _ = fit(deltas[:mid], ys[:mid])
+    B2, _, _, _ = fit(deltas[mid:], ys[mid:])
+    rel = np.linalg.norm(B1 - B2) / max(np.linalg.norm(0.5 * (B1 + B2)), 1e-12)
+    cos = []
+    for i in range(B1.shape[0]):
+        a, b = B1[i], B2[i]
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        cos.append(float(a @ b / denom) if denom > 1e-12 else 0.0)
+    return rel, np.array(cos)
+
+
+def process(model_path, steps, dither, seed, hold=120, randomize_init=False):
     model = PPO.load(model_path)
-    env = make_env_from_model_path(model_path, render=False)
+    # Identification measures the healthy robot's influence
+    env = make_env_from_model_path(model_path, render=False,
+                                   randomize_init=randomize_init)
     rng = np.random.default_rng(seed)
     deltas, ys = collect(model, env, steps, dither, rng, hold=hold)
     env.close()
 
     B, y0, r2, n = fit(deltas, ys)
+    rel, cos = split_half_agreement(deltas, ys)
+
     out = model_path + "_influence.npz"
     np.savez(out, B=B, y0=y0, r2=r2, n_samples=n, dither=dither, steps=steps,
-             hold=hold, smooth_window=SMOOTH_WINDOW, response_lag=RESPONSE_LAG)
+             hold=hold, split_half_rel=rel, split_half_cos=cos,
+             randomize_init=randomize_init,
+             smooth_window=SMOOTH_WINDOW, response_lag=RESPONSE_LAG)
 
     labels = ("forward", "lateral", "yaw")
-    print(f"  {os.path.basename(model_path)}: n={n}, "
-          f"R2 = " + ", ".join(f"{l}={v:.3f}" for l, v in zip(labels, r2)))
+    print(f"  {os.path.basename(model_path)}: n={n}, randomize_init={randomize_init}")
+    print(f"    R2            " + ", ".join(f"{l}={v:.3f}" for l, v in zip(labels, r2)))
+    print(f"    split-half    rel.diff={rel:.3f}, cos = "
+          + ", ".join(f"{l}={c:+.3f}" for l, c in zip(labels, cos)))
     print(f"    baseline y0 = {np.round(y0, 4)}   ||B|| = {np.linalg.norm(B):.4f}")
-    if r2[0] < 0.05:
-        print(f"    WARNING: forward-velocity R2 is very low. The linear influence "
-              f"model explains little variance, so B^+ may point corrections in "
-              f"poorly-chosen directions. Try a larger --dither or more --steps.")
+    if cos[0] > 0.8 and rel < 0.5:
+        msg = "    -> B is well determined (independent halves agree)."
+        if r2[0] < 0.3:
+            msg += (" The low R2 reflects nuisance variance the dither cannot "
+                    "explain, not a bad estimate of B.")
+        print(msg)
+    elif cos[0] > 0.5:
+        print(f"    -> B is marginally determined. Usable, but consider more --steps "
+              f"or larger --dither.")
+    else:
+        print(f"    -> WARNING: independent halves DISAGREE on B. The estimate is "
+              f"noise-dominated; corrections computed from it would point in "
+              f"arbitrary directions. Increase --dither / --steps before using it.")
     print(f"    saved -> {out}")
     return B, y0, r2
 
@@ -104,6 +138,10 @@ def main():
     parser.add_argument("--hold", type=int, default=120,
                         help="Steps to hold each dither sample. Long holds excite the "
                              "low frequencies the fit depends on; per-step dither does not.")
+    parser.add_argument("--randomize_init", action="store_true",
+                        help="Keep initial-state randomization on during identification. "
+                             "Off by default: it adds variance that buries the dither "
+                             "signal without changing B.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -121,7 +159,8 @@ def main():
         for sid in seeds:
             mp = os.path.join(args.models_dir, f"seed_{sid}")
             if os.path.exists(mp + ".zip"):
-                _, _, r2 = process(mp, args.steps, args.dither, args.seed, args.hold)
+                _, _, r2 = process(mp, args.steps, args.dither, args.seed,
+                                   args.hold, args.randomize_init)
                 r2s.append(r2)
         if r2s:
             r2s = np.array(r2s)
@@ -132,8 +171,10 @@ def main():
         if not args.model:
             print("Pass --model or --all")
             return
-        process(args.model, args.steps, args.dither, args.seed, args.hold)
+        process(args.model, args.steps, args.dither, args.seed,
+                args.hold, args.randomize_init)
 
 
 if __name__ == "__main__":
     main()
+    
