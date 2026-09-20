@@ -5,7 +5,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-import pybullet as p
+import pybullet as p  # noqa: F401  (DLL load order on Windows)
 from stable_baselines3 import PPO
 
 from envs.quadruped_env import make_env_from_model_path
@@ -13,21 +13,36 @@ from envs.quadruped_env import make_env_from_model_path
 LABELS = ("forward", "lateral", "yaw")
 
 
-def run_episode(model, env, offset, max_steps, seed, settle=40):
+def ridge_pinv(Bm, lam=0.05):
+    return Bm.T @ np.linalg.inv(Bm @ Bm.T + lam * np.eye(Bm.shape[0]))
+
+
+def run_episode(model, env, offset, max_steps, seed, settle=40,
+                fault=None, fault_step=150, fault_severity=1.0,
+                offset_start=0, measure_from=None):
     obs, info = env.reset(seed=seed)
+    if measure_from is None:
+        measure_from = settle
     fwd, lat, yaw = [], [], []
+    fell = False
     for t in range(max_steps):
+        if fault is not None and t == fault_step:
+            env.trigger_fault(fault, severity=fault_severity)
         base, _ = model.predict(obs, deterministic=True)
-        obs, r, term, trunc, info = env.step(np.clip(base + offset, -1.0, 1.0))
-        if t >= settle:                       # drop the startup transient
+        off = offset if t >= offset_start else np.zeros_like(offset)
+        obs, r, term, trunc, info = env.step(np.clip(base + off, -1.0, 1.0))
+        if t >= measure_from:
             fwd.append(info["forward_vel"])
             lat.append(info["lateral_vel"])
             yaw.append(info["yaw_rate"])
-        if term or trunc:
+        if term:
+            fell = True
+            break
+        if trunc:
             break
     if not fwd:
-        return None, t + 1
-    return np.array([np.mean(fwd), np.mean(lat), np.mean(yaw)]), t + 1
+        return None, t + 1, fell
+    return np.array([np.mean(fwd), np.mean(lat), np.mean(yaw)]), t + 1, fell
 
 
 def split_half(X, Y):
@@ -70,11 +85,12 @@ def main():
 
     print(f"Probing control authority: {args.episodes} episodes, one constant "
           f"offset each (std {args.scale})\n")
-    
+
+    # Baseline
     base_env = make_env_from_model_path(args.model, render=False, randomize_init=True)
     base_runs = []
     for k in range(8):
-        y, n = run_episode(model, base_env, np.zeros(n_act), args.max_steps, seed=1000 + k)
+        y, n, _ = run_episode(model, base_env, np.zeros(n_act), args.max_steps, seed=1000 + k)
         if y is not None:
             base_runs.append(y)
     base_env.close()
@@ -87,7 +103,7 @@ def main():
     X, Y, short = [], [], 0
     for e in range(args.episodes):
         off = rng.normal(0.0, args.scale, size=n_act)
-        y, n = run_episode(model, env, off, args.max_steps, seed=e)
+        y, n, _ = run_episode(model, env, off, args.max_steps, seed=e)
         if y is None:
             continue
         if n < 0.5 * args.max_steps:
@@ -123,15 +139,12 @@ def main():
     if rel is not None:
         print(f"  split-half rel.diff = {rel:.3f}")
 
-    # direct authority test 
-    def ridge_pinv(Bm, lam=0.05):
-        return Bm.T @ np.linalg.inv(Bm @ Bm.T + lam * np.eye(Bm.shape[0]))
-
+    # direct authority test
     print("\n" + "-" * 70)
     print("DIRECT TEST: request a forward correction, measure what is delivered")
     print(f"  (delta bounded at +/-{args.delta_max} per joint, as in ResidualAdapter)")
     env2 = make_env_from_model_path(args.model, render=False, randomize_init=False)
-    y_ref, _ = run_episode(model, env2, np.zeros(n_act), args.max_steps, seed=7)
+    y_ref, _, _ = run_episode(model, env2, np.zeros(n_act), args.max_steps, seed=7)
     print(f"\n  {'requested':>10}{'||delta||':>11}{'clipped':>9}{'delivered':>11}{'fraction':>10}")
     delivered_abs = []
     for target in (0.10, 0.20, 0.30):
@@ -139,7 +152,7 @@ def main():
         norm_raw = np.linalg.norm(d)
         d_cl = np.clip(d, -args.delta_max, args.delta_max)
         was_clipped = not np.allclose(d, d_cl)
-        y_new, _ = run_episode(model, env2, d_cl, args.max_steps, seed=7)
+        y_new, _, _ = run_episode(model, env2, d_cl, args.max_steps, seed=7)
         delivered = (y_new[0] - y_ref[0]) if y_new is not None else float("nan")
         frac = delivered / target if target else float("nan")
         delivered_abs.append(delivered)
@@ -153,10 +166,65 @@ def main():
     print("  those, a DC offset cannot restore commanded speed regardless of how")
     print("  well B is identified.")
 
-    # verdict 
+    WORST_DROP = 0.27      # largest fault-induced velocity drop to undo (m/s)
+
+    # authority on a damaged robot 
+    print("\n" + "-" * 70)
+    print("AUTHORITY UNDER FAULT (paired: same seed, same fault, delta on vs off)")
+    env3 = make_env_from_model_path(args.model, render=False, randomize_init=False)
+    FSTEP, MEASURE = 150, 260
+    faults = [("torque_limit", 0.2), ("joint_lock", 1.0), ("actuation_delay", 5)]
+    print(f"\n  {'fault':<17}{'sev':>6}{'v_fault':>10}{'v_+delta':>10}"
+          f"{'gain':>9}{'healthy':>9}")
+    fault_gains = []
+    for fname, fsev in faults:
+        gains, n_ok = [], 0
+        for sd in range(4):
+            y0f, _, fell0 = run_episode(model, env3, np.zeros(n_act), args.max_steps,
+                                        seed=sd, fault=fname, fault_severity=fsev,
+                                        fault_step=FSTEP, offset_start=FSTEP,
+                                        measure_from=MEASURE)
+            if y0f is None:
+                continue
+            # ask for the shortfall the fault actually created
+            want = float(np.clip(args.scale * 0 + (y0[0] - y0f[0]), 0.05, 0.40))
+            d = ridge_pinv(B) @ np.array([want, 0.0, 0.0])
+            d = np.clip(d, -args.delta_max, args.delta_max)
+            y1f, _, fell1 = run_episode(model, env3, d, args.max_steps,
+                                        seed=sd, fault=fname, fault_severity=fsev,
+                                        fault_step=FSTEP, offset_start=FSTEP,
+                                        measure_from=MEASURE)
+            if y1f is None:
+                continue
+            gains.append((y0f[0], y1f[0], y1f[0] - y0f[0]))
+            n_ok += 1
+        if not gains:
+            print(f"  {fname:<17}{fsev:>6}   (all trials ended before measurement)")
+            continue
+        g = np.array(gains)
+        fault_gains.append(g[:, 2].mean())
+        print(f"  {fname:<17}{fsev:>6}{g[:,0].mean():>10.4f}{g[:,1].mean():>10.4f}"
+              f"{g[:,2].mean():>+9.4f}{max_delivered:>+9.4f}")
+    env3.close()
+
+    best_fault_gain = max(fault_gains) if fault_gains else 0.0
+    ratio = best_fault_gain / max_delivered if abs(max_delivered) > 1e-9 else float("inf")
+    print(f"\n  Best delivered correction under fault: {best_fault_gain:+.4f} m/s")
+    print(f"  vs healthy-robot measurement:          {max_delivered:+.4f} m/s "
+          f"({ratio:.1f}x)")
+    if best_fault_gain > 2.0 * max(max_delivered, 1e-9):
+        print("  -> Authority is substantially HIGHER under fault. The healthy-robot")
+        print("     measurement understated it because the intact policy cancels the")
+        print("     offset. Fit B on DAMAGED rollouts, or accept the nominal B as a")
+        print("     direction-only estimate and let integral action set the scale.")
+    elif best_fault_gain > 0.5 * WORST_DROP:
+        print("  -> Sufficient under fault even though it looked marginal when healthy.")
+    else:
+        print("  -> Still insufficient under fault. This is a genuine limit of DC")
+        print("     joint offsets, not a measurement artefact.")
+
+    # ---- verdict ----
     print("\n" + "=" * 70)
-    # Largest fault-induced drop the method would have to undo (m/s).
-    WORST_DROP = 0.27
     sufficient = max_delivered >= 0.6 * WORST_DROP
     partial = max_delivered >= 0.25 * WORST_DROP
 
