@@ -33,9 +33,8 @@ def per_seed_stats(csv_path):
         recovered_times = [t for t in rec_times if t is not None]
         distances = [d for d in (_f(r["post_fault_distance_m"]) for r in rows) if d is not None]
         drops = [d for d in (_f(r.get("velocity_drop_frac")) for r in rows) if d is not None]
+        settled = [d for d in (_f(r.get("settled_deficit")) for r in rows) if d is not None]
         falls = [_truthy(r["fell"]) for r in rows]
-
-        # recovery_status is authoritative when present
         statuses = [r.get("recovery_status", "") for r in rows]
         has_status = any(statuses)
         n_degraded = sum(1 for r in rows if _truthy(r.get("degraded", "")))
@@ -44,13 +43,14 @@ def per_seed_stats(csv_path):
 
         out[fault_type] = {
             "n_trials": n,
-            # Conditional recovery rate
             "recovery_rate": (n_recovered / n_degraded) if (has_status and n_degraded)
                              else (len(recovered_times) / n if n and not has_status else 0.0),
             "degradation_rate": (n_degraded / n) if n else 0.0,
             "no_degradation_rate": (n_nodeg / n) if (has_status and n) else None,
             "fall_rate": sum(falls) / n if n else 0.0,
             "mean_velocity_drop": statistics.mean(drops) if drops else None,
+            "mean_settled_deficit": statistics.mean(settled) if settled else None,
+            "n_settled": len(settled),
             "mean_recovery_time_s": statistics.mean(recovered_times) if recovered_times else None,
             "mean_post_fault_distance_m": statistics.mean(distances) if distances else None,
         }
@@ -127,7 +127,7 @@ def main():
         print("converged, so ALL result files are being included. Any non-converged")
         print("seed present will contaminate these numbers.\n")
 
-    # convergence rate from the manifest, if present
+    # convergence rate from the manifest, if present 
     manifest_path = os.path.join(args.results_dir, "manifest.json")
     if os.path.exists(manifest_path):
         with open(manifest_path) as f:
@@ -174,6 +174,7 @@ def main():
         rec_rates = [all_seeds[s].get(fault_type, {}).get("recovery_rate") for s in seed_labels]
         deg_rates = [all_seeds[s].get(fault_type, {}).get("degradation_rate") for s in seed_labels]
         drops = [all_seeds[s].get(fault_type, {}).get("mean_velocity_drop") for s in seed_labels]
+        settled_d = [all_seeds[s].get(fault_type, {}).get("mean_settled_deficit") for s in seed_labels]
         fall_rates = [all_seeds[s].get(fault_type, {}).get("fall_rate") for s in seed_labels]
         rec_times = [all_seeds[s].get(fault_type, {}).get("mean_recovery_time_s") for s in seed_labels]
         dists = [all_seeds[s].get(fault_type, {}).get("mean_post_fault_distance_m") for s in seed_labels]
@@ -185,9 +186,14 @@ def main():
 
         dg_m, dg_sd, _ = summarize(deg_rates)
         dr_m, dr_sd, _ = summarize(drops)
+        sd_m, sd_sd, sd_n = summarize(settled_d)
         print(f"  Degradation rate    : {fmt(dg_m, dg_sd, pct=True)}   "
               f"(fault measurably slowed the robot)")
-        print(f"  Velocity drop       : {fmt(dr_m, dr_sd, pct=True)}   (mean worst-case)")
+        print(f"  Transient dip       : {fmt(dr_m, dr_sd, pct=True)}   "
+              f"(worst short-window dip; descriptive only)")
+        if sd_m is not None:
+            print(f"  Settled deficit     : {fmt(sd_m, sd_sd)} m/s   "
+                  f"(lasting loss over final 2 s; what a correction must restore)")
         print(f"  Recovery rate       : {fmt(rr_m, rr_sd, pct=True)}   "
               f"(of DEGRADED trials; n={rr_n} seeds)")
         print(f"  Fall rate           : {fmt(fr_m, fr_sd, pct=True)}")
@@ -200,7 +206,6 @@ def main():
         )
         print(f"  per-seed recovery   : {per_seed_str}")
 
-        # Flag effects that rest on one seed
         clean = [v for v in rec_rates if v is not None]
         if len(clean) > 2:
             spread = max(clean) - min(clean)
@@ -216,6 +221,8 @@ def main():
             "recovery_rate_sd": round(rr_sd, 4) if rr_sd is not None else "",
             "degradation_rate_mean": round(dg_m, 4) if dg_m is not None else "",
             "velocity_drop_mean": round(dr_m, 4) if dr_m is not None else "",
+            "settled_deficit_mean_mps": round(sd_m, 4) if sd_m is not None else "",
+            "settled_deficit_sd_mps": round(sd_sd, 4) if sd_sd is not None else "",
             "fall_rate_mean": round(fr_m, 4) if fr_m is not None else "",
             "fall_rate_sd": round(fr_sd, 4) if fr_sd is not None else "",
             "recovery_time_mean_s": round(rt_m, 4) if rt_m is not None else "",

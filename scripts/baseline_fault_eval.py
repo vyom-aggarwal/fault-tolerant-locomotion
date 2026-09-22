@@ -14,7 +14,7 @@ from envs.quadruped_env import make_env_from_model_path
 
 # Experiment configuration
 
-# Default: one severity per fault type (matches the original experiment).
+# Default
 FAULT_CONFIGS = [
     {"type": "torque_limit", "severity": 0.2},
     {"type": "joint_lock", "severity": 1.0},
@@ -23,7 +23,6 @@ FAULT_CONFIGS = [
     {"type": "sensor_noise", "severity": 0.3},
 ]
 
-# --sweep: vary severity to get a dose-response curve. Far more informative than a single point
 FAULT_SWEEP = [
     {"type": "torque_limit", "severity": s} for s in (0.5, 0.3, 0.2, 0.1, 0.05)
 ] + [
@@ -31,18 +30,14 @@ FAULT_SWEEP = [
 ] + [
     {"type": "sensor_noise", "severity": s} for s in (0.1, 0.3, 0.6, 1.0)
 ] + [
-    # joint_lock and sensor_dropout have no continuous severity axis at one joint
     {"type": "joint_lock", "severity": 1.0},
     {"type": "sensor_dropout", "severity": 1.0},
 ]
 
-# Fault onset is DRAWN PER TRIAL, not fixed
 FAULT_ONSET_MIN = 150
 FAULT_ONSET_MAX = 250
-POST_FAULT_WINDOW = 300         # observe ~5 s afterwards
-BASELINE_WINDOW = 50            # steps averaged to define pre-fault speed
-SMOOTHING_WINDOW = 30           # ~0.5 s rolling mean -- spans a full stride
-SUSTAINED_STEPS = 30            # recovery must hold this long (~0.5 s)
+SETTLE_STEPS = 120              # 2 s, ~6 strides
+BASELINE_WINDOW = SETTLE_STEPS
 RECOVERY_TOLERANCE = 0.15       # within 15% of pre-fault speed
 CONTROL_HZ = 60.0               # 240 Hz physics / action_repeat 4
 
@@ -50,6 +45,7 @@ CONTROL_HZ = 60.0               # 240 Hz physics / action_repeat 4
 # Metric computation (pure -- no simulator, so it is directly testable)
 
 def rolling_mean(values, window):
+    """Causal rolling mean; output[i] uses values[max(0,i-window+1) : i+1]."""
     out = []
     for i in range(len(values)):
         lo = max(0, i - window + 1)
@@ -60,10 +56,9 @@ def rolling_mean(values, window):
 
 def analyze_trace(pre_fault_vels, post_fault_vels, fell,
                   smoothing_window=SMOOTHING_WINDOW,
-                  sustained_steps=SUSTAINED_STEPS,
+                  settle_steps=SETTLE_STEPS,
                   tolerance=RECOVERY_TOLERANCE,
                   control_hz=CONTROL_HZ):
-
     base_chunk = pre_fault_vels[-BASELINE_WINDOW:] if pre_fault_vels else [0.0]
     baseline = statistics.mean(base_chunk)
     baseline_sd = statistics.stdev(base_chunk) if len(base_chunk) > 1 else 0.0
@@ -75,42 +70,64 @@ def analyze_trace(pre_fault_vels, post_fault_vels, fell,
         "degraded": False,
         "recovery_status": "no_degradation",
         "recovery_time_s": None,
+        "settled_vel": None,
+        "settled_deficit": None,
     }
 
     if abs(baseline) < 1e-6 or not post_fault_vels:
         result["recovery_status"] = "fell" if fell else "no_degradation"
         return result
 
-    smoothed = rolling_mean(post_fault_vels, smoothing_window)
     lower = baseline * (1.0 - tolerance)
+    band = tolerance * abs(baseline)
 
-    # How far did the smoothed speed fall below the pre-fault level?
-    min_smoothed = min(smoothed)
-    result["velocity_drop_frac"] = (baseline - min_smoothed) / abs(baseline)
+    smoothed = rolling_mean(post_fault_vels, smoothing_window)
+    result["velocity_drop_frac"] = (baseline - min(smoothed)) / abs(baseline)
 
-    # First point where degradation is actually visible.
-    deg_idx = next((i for i, v in enumerate(smoothed) if v < lower), None)
+    n = len(post_fault_vels)
+    if n >= settle_steps:
+        csum = [0.0]
+        for v in post_fault_vels:
+            csum.append(csum[-1] + v)
+        n_win = n - settle_steps + 1
+
+        def wmean(j):
+            return (csum[j + settle_steps] - csum[j]) / settle_steps
+
+        deg_idx = next((j for j in range(n_win) if wmean(j) < lower), None)
+    else:
+        wmean, n_win = None, 0
+        deg_idx = next((i for i, v in enumerate(smoothed) if v < lower), None)
+
     result["degraded"] = deg_idx is not None
 
     if fell:
-        # A fall is never a recovery, whatever the velocity did beforehand.
         result["recovery_status"] = "fell"
         return result
 
+    if wmean is None:
+        result["recovery_status"] = "no_recovery" if deg_idx is not None else "no_degradation"
+        return result
+
+    settled = wmean(n_win - 1)
+    result["settled_vel"] = settled
+    result["settled_deficit"] = baseline - settled
+
     if deg_idx is None:
-        # The fault never measurably slowed the robot. This is a real and interesting outcome
         result["recovery_status"] = "no_degradation"
         return result
 
-    # Search from the point of degradation onward for a SUSTAINED return.
-    for i in range(deg_idx, len(smoothed) - sustained_steps + 1):
-        window = smoothed[i:i + sustained_steps]
-        if all(abs(v - baseline) <= tolerance * abs(baseline) for v in window):
-            result["recovery_status"] = "recovered"
-            result["recovery_time_s"] = i / control_hz
-            return result
+    last_bad = -1
+    for j in range(n_win):
+        if abs(wmean(j) - baseline) > band:
+            last_bad = j
 
-    result["recovery_status"] = "no_recovery"
+    if abs(settled - baseline) <= band:
+        start_idx = max(last_bad + 1, deg_idx)
+        result["recovery_status"] = "recovered"
+        result["recovery_time_s"] = start_idx / control_hz
+    else:
+        result["recovery_status"] = "no_recovery"
     return result
 
 
@@ -128,9 +145,9 @@ def run_trial(model, env, fault_config, seed, n_joints=1):
         obs, reward, terminated, truncated, info = env.step(action)
         pre_fault_vels.append(info["forward_vel"])
         if terminated or truncated:
-            return None  # fell before the fault -- says nothing about fault response
+            return None  # fell before the fault
 
-    # Inject. n_joints>1 calls trigger_fault repeatedly, which is the severity axis for the otherwise-binary joint_lock and sensor_dropout faults.
+    # Inject
     for _ in range(max(1, n_joints)):
         env.trigger_fault(fault_config["type"], severity=fault_config["severity"])
 
@@ -150,7 +167,7 @@ def run_trial(model, env, fault_config, seed, n_joints=1):
             fell = True
             break
         if truncated:
-            break
+            return None
 
     end_pos = np.array(p.getBasePositionAndOrientation(
         env.robot_id, physicsClientId=env._client)[0])
@@ -167,6 +184,10 @@ def run_trial(model, env, fault_config, seed, n_joints=1):
         "baseline_vel": round(metrics["baseline_vel"], 5),
         "baseline_vel_sd": round(metrics["baseline_vel_sd"], 5),
         "velocity_drop_frac": round(metrics["velocity_drop_frac"], 5),
+        "settled_vel": round(metrics["settled_vel"], 5)
+                       if metrics["settled_vel"] is not None else "",
+        "settled_deficit": round(metrics["settled_deficit"], 5)
+                           if metrics["settled_deficit"] is not None else "",
         "degraded": metrics["degraded"],
         "recovery_status": metrics["recovery_status"],
         "recovery_time_s": round(metrics["recovery_time_s"], 4)
@@ -185,7 +206,6 @@ def main():
     parser.add_argument("--sweep", action="store_true",
                         help="Sweep fault severity instead of using one value per type. "
                              "Produces a dose-response curve.")
-    # Initial-state randomization now lives in the environment (randomize_init), and is loaded from the training config, so it always matches training.
     parser.add_argument("--n_joints", type=int, default=1,
                         help="How many joints each fault affects. >1 is the severity "
                              "axis for joint_lock and sensor_dropout.")
@@ -196,6 +216,15 @@ def main():
     model = PPO.load(args.model)
     env = make_env_from_model_path(args.model, render=False)
 
+    latest_end = (FAULT_ONSET_MAX - 1) + POST_FAULT_WINDOW
+    if latest_end >= env.max_episode_steps:
+        raise SystemExit(
+            f"Observation window does not fit: onset up to {FAULT_ONSET_MAX - 1} + "
+            f"window {POST_FAULT_WINDOW} = {latest_end} >= max_episode_steps "
+            f"{env.max_episode_steps}. Shorten POST_FAULT_WINDOW or FAULT_ONSET_MAX.")
+    print(f"Observation window: {POST_FAULT_WINDOW} steps "
+          f"({POST_FAULT_WINDOW / CONTROL_HZ:.1f} s) after onset; recovery must hold "
+          f"through the final {SETTLE_STEPS} steps ({SETTLE_STEPS / CONTROL_HZ:.1f} s).")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     results = []
