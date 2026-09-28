@@ -16,14 +16,13 @@ CHANGE_STEP = 150
 MEASURE_FROM = 300
 MEASURE_TO = 800
 MAX_STEPS = 1000
-DC_OFFSET_AUTHORITY = 0.055   # best forward change a constant offset delivered
-
+DC_OFFSET_AUTHORITY = 0.055   
 MEASURED_DEFICIT = {"torque_limit": 0.106, "joint_lock": 0.099, "actuation_delay": 0.197}
 
 
 def rollout(model, env, seed, base_scale, scale=1.0, mode="joint",
             fault=None, severity=1.0):
-    env._action_scale = base_scale            # restore: reset() does not
+    env._action_scale = base_scale
     obs, info = env.reset(seed=seed)
     vels, sat = [], []
     fell = False
@@ -92,12 +91,17 @@ def print_table(res, trials, label):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/seed_0")
-    parser.add_argument("--trials", type=int, default=8,
+    parser.add_argument("--trials", type=int, default=12,
                         help="Seeds per (condition, scale). Paired across scales.")
+    parser.add_argument("--no_randomize", action="store_true",
+                        help="Disable initial-state randomization. Debugging only: "
+                             "it makes faults that affect all joints produce "
+                             "identical trials, so n is effectively 1.")
     args = parser.parse_args()
 
     model = PPO.load(args.model)
-    env = make_env_from_model_path(args.model, render=False, randomize_init=False)
+    env = make_env_from_model_path(args.model, render=False,
+                                   randomize_init=not args.no_randomize)
     base_scale = float(env._action_scale)
 
     print("Amplitude-channel authority probe")
@@ -105,7 +109,7 @@ def main():
           f"{MEASURE_FROM}-{MEASURE_TO}, {args.trials} paired seeds each")
     print(f"  base joint action_scale = {base_scale}")
 
-    # healthy: action-space vs joint-space 
+    # ---- healthy: action-space vs joint-space ----
     print("\n" + "=" * 74)
     print("HEALTHY ROBOT")
     print("=" * 74)
@@ -132,7 +136,7 @@ def main():
         print_table(res, args.trials, f"{fname} (severity {fsev})")
     env.close()
 
-    # ---- verdict ----
+    # verdict 
     print("\n" + "=" * 74)
     print("AMPLITUDE vs OFFSET, judged against the measured deficits")
     print("=" * 74)
@@ -195,6 +199,10 @@ def main():
         print("  STABILITY: no scale materially reduces falls at these settings.")
     print(f"\n  {args.trials}-seed probes on one policy: they indicate which channel is")
     print("  worth building a method around, not effect sizes for the paper.")
+    if args.no_randomize:
+        print("  WARNING: --no_randomize is set. Faults affecting all joints "
+              "(actuation_delay)")
+        print("  produce identical trials, so their fall counts are n=1.")
 
 
 if __name__ == "__main__":

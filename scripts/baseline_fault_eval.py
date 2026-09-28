@@ -14,11 +14,11 @@ from envs.quadruped_env import make_env_from_model_path
 
 # Experiment configuration
 
-# Default
+# Default: one severity per fault type
 FAULT_CONFIGS = [
     {"type": "torque_limit", "severity": 0.2},
     {"type": "joint_lock", "severity": 1.0},
-    {"type": "actuation_delay", "severity": 10},
+    {"type": "actuation_delay", "severity": 5},
     {"type": "sensor_dropout", "severity": 1.0},
     {"type": "sensor_noise", "severity": 0.3},
 ]
@@ -26,7 +26,7 @@ FAULT_CONFIGS = [
 FAULT_SWEEP = [
     {"type": "torque_limit", "severity": s} for s in (0.5, 0.3, 0.2, 0.1, 0.05)
 ] + [
-    {"type": "actuation_delay", "severity": s} for s in (5, 10, 20, 40)
+    {"type": "actuation_delay", "severity": s} for s in (1, 2, 3, 5, 10, 20)
 ] + [
     {"type": "sensor_noise", "severity": s} for s in (0.1, 0.3, 0.6, 1.0)
 ] + [
@@ -36,6 +36,8 @@ FAULT_SWEEP = [
 
 FAULT_ONSET_MIN = 150
 FAULT_ONSET_MAX = 250
+POST_FAULT_WINDOW = 700
+SMOOTHING_WINDOW = 30
 SETTLE_STEPS = 120              # 2 s, ~6 strides
 BASELINE_WINDOW = SETTLE_STEPS
 RECOVERY_TOLERANCE = 0.15       # within 15% of pre-fault speed
@@ -81,6 +83,7 @@ def analyze_trace(pre_fault_vels, post_fault_vels, fell,
     lower = baseline * (1.0 - tolerance)
     band = tolerance * abs(baseline)
 
+    # Transient dip
     smoothed = rolling_mean(post_fault_vels, smoothing_window)
     result["velocity_drop_frac"] = (baseline - min(smoothed)) / abs(baseline)
 
@@ -145,9 +148,8 @@ def run_trial(model, env, fault_config, seed, n_joints=1):
         obs, reward, terminated, truncated, info = env.step(action)
         pre_fault_vels.append(info["forward_vel"])
         if terminated or truncated:
-            return None  # fell before the fault
+            return None  # fell before the fault 
 
-    # Inject
     for _ in range(max(1, n_joints)):
         env.trigger_fault(fault_config["type"], severity=fault_config["severity"])
 
@@ -167,6 +169,7 @@ def run_trial(model, env, fault_config, seed, n_joints=1):
             fell = True
             break
         if truncated:
+            # Should be unreachable given the onset/window constants 
             return None
 
     end_pos = np.array(p.getBasePositionAndOrientation(
@@ -206,16 +209,26 @@ def main():
     parser.add_argument("--sweep", action="store_true",
                         help="Sweep fault severity instead of using one value per type. "
                              "Produces a dose-response curve.")
+    parser.add_argument("--faults", type=str, default=None,
+                        help="Comma-separated fault types to run (default: all). "
+                             "Lets one fault be re-measured without repeating the "
+                             "others, which take hours.")
     parser.add_argument("--n_joints", type=int, default=1,
                         help="How many joints each fault affects. >1 is the severity "
                              "axis for joint_lock and sensor_dropout.")
     args = parser.parse_args()
 
     configs = FAULT_SWEEP if args.sweep else FAULT_CONFIGS
+    if args.faults:
+        wanted = {f.strip() for f in args.faults.split(",")}
+        unknown = wanted - {c["type"] for c in configs}
+        if unknown:
+            raise SystemExit(f"Unknown fault type(s): {sorted(unknown)}")
+        configs = [c for c in configs if c["type"] in wanted]
+        print(f"Running only: {sorted(wanted)}")
 
     model = PPO.load(args.model)
     env = make_env_from_model_path(args.model, render=False)
-
     latest_end = (FAULT_ONSET_MAX - 1) + POST_FAULT_WINDOW
     if latest_end >= env.max_episode_steps:
         raise SystemExit(
