@@ -53,7 +53,7 @@ def run_trial(model, env, adapter, fault, severity, seed):
             fell = True
             break
         if trunc:
-            return None          # window truncated; unusable
+            return None
 
     m = analyze_trace(pre, post, fell)
     d = adapter.diagnostics()

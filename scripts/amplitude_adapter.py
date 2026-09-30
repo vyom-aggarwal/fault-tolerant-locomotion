@@ -2,6 +2,7 @@ import numpy as np
 
 
 class AmplitudeAdapter:
+
     def __init__(
         self,
         base_scale,
@@ -12,6 +13,8 @@ class AmplitudeAdapter:
         k_threshold=3.0,          # risk threshold = healthy mean + k * healthy sd
         decrease=0.04,            # multiplicative back-off per step when at risk
         increase=0.0015,          # additive recovery per step when calm
+        risk_mode="osc",          # "tilt" | "osc"
+        osc_weight=3.0,           # weight on tilt VARIABILITY when risk_mode="osc"
         smooth_window=30,         # ~1 stride, so gait wobble is not read as risk
         calibrate_steps=120,      # 2 s of healthy walking to set the threshold
         min_threshold=0.02,       # floor, in case healthy walking is unusually smooth
@@ -25,6 +28,8 @@ class AmplitudeAdapter:
         self.k = float(k_threshold)
         self.decrease = float(decrease)
         self.increase = float(increase)
+        self.risk_mode = risk_mode
+        self.osc_weight = float(osc_weight)
         self.smooth_window = int(smooth_window)
         self.calibrate_steps = int(calibrate_steps)
         self.min_threshold = float(min_threshold)
@@ -51,12 +56,19 @@ class AmplitudeAdapter:
         if self.mode in ("none", "fixed"):
             return
 
-        # Tilt away from upright. 0 when perfectly level.
-        risk = 1.0 - float(info.get("upright_alignment", 1.0))
-        self._risk_hist.append(risk)
+        # Tilt away from upright. 0 when level.
+        tilt = 1.0 - float(info.get("upright_alignment", 1.0))
+        self._risk_hist.append(tilt)
         w = min(self.smooth_window, len(self._risk_hist))
-        risk_s = float(np.mean(self._risk_hist[-w:]))
+        recent = self._risk_hist[-w:]
 
+        if self.risk_mode == "tilt":
+            risk_s = float(np.mean(recent))
+        else:
+            # Delay-induced instability appears as OSCILLATION before it appears as lean
+            risk_s = float(np.mean(recent)) + self.osc_weight * float(np.std(recent))
+
+        # Calibrate on the robot's own healthy walking
         if self.step_count <= self.calibrate_steps:
             self._calib.append(risk_s)
             return
@@ -79,6 +91,7 @@ class AmplitudeAdapter:
             "mean_scale": round(float(np.mean(self.s_trace)), 4) if self.s_trace else None,
             "min_scale": round(float(np.min(self.s_trace)), 4) if self.s_trace else None,
             "threshold": round(self.threshold, 5) if self.threshold is not None else None,
+            "risk_mode": self.risk_mode,
             "backoff_steps": self.n_backoff,
             "steps": self.step_count,
         }
