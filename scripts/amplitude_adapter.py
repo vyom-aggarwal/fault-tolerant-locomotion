@@ -2,17 +2,21 @@ import numpy as np
 
 
 class AmplitudeAdapter:
-
     def __init__(
         self,
         base_scale,
         mode="adaptive",          # "none" | "fixed" | "adaptive"
         fixed_scale=0.70,         # used when mode == "fixed"
-        s_min=0.60,
+        # 0.60 was binding in every sweep configuration (min_s hit the floor
+        # every time), so the controller had no room left at high severity.
+        s_min=0.50,
         s_max=1.00,
-        k_threshold=3.0,          # risk threshold = healthy mean + k * healthy sd
+        # Swept on seed 0, actuation_delay(5): "osc" risk reached 0% falls where
+        # every "tilt" configuration stayed at 20-33%. k=1.0 and a slow increase
+        # were the best of the safe configurations.
+        k_threshold=1.0,          # risk threshold = healthy mean + k * healthy sd
         decrease=0.04,            # multiplicative back-off per step when at risk
-        increase=0.0015,          # additive recovery per step when calm
+        increase=0.0002,          # additive recovery per step when calm
         risk_mode="osc",          # "tilt" | "osc"
         osc_weight=3.0,           # weight on tilt VARIABILITY when risk_mode="osc"
         smooth_window=30,         # ~1 stride, so gait wobble is not read as risk
@@ -46,7 +50,6 @@ class AmplitudeAdapter:
 
     # per step 
     def apply(self, env):
-        """Set the environment's joint-space action scale for this step."""
         env._action_scale = self.base_scale * self.s
         self.s_trace.append(self.s)
         return self.s
@@ -68,7 +71,7 @@ class AmplitudeAdapter:
             # Delay-induced instability appears as OSCILLATION before it appears as lean
             risk_s = float(np.mean(recent)) + self.osc_weight * float(np.std(recent))
 
-        # Calibrate on the robot's own healthy walking
+        # Calibrate on the robot's own healthy walking, so no per-policy tuning and no fault detector are required.
         if self.step_count <= self.calibrate_steps:
             self._calib.append(risk_s)
             return

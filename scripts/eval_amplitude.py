@@ -53,7 +53,7 @@ def run_trial(model, env, adapter, fault, severity, seed):
             fell = True
             break
         if trunc:
-            return None
+            return None          # window truncated; unusable
 
     m = analyze_trace(pre, post, fell)
     d = adapter.diagnostics()
@@ -100,7 +100,7 @@ def evaluate(model_path, trials, fixed_scale):
 def summarize(rows, fixed_scale):
     by = {}
     for r in rows:
-        by.setdefault((r["fault_type"], r["mode"]), []).append(r)
+        by.setdefault((f"{r['fault_type']}({r['severity']})", r["mode"]), []).append(r)
 
     print("\n" + "=" * 86)
     print("ADAPTIVE vs FIXED vs NONE")
@@ -137,21 +137,29 @@ def summarize(rows, fixed_scale):
         if not all(m in st for m in MODES):
             continue
         f_none, f_fix, f_ad = st["none"][1], st["fixed"][1], st["adaptive"][1]
-        v_fix, v_ad = st["fixed"][3], st["adaptive"][3]
-        # Speed is only comparable between conditions with similar fall rates
-        comparable = abs(f_ad - f_fix) < 0.15
-        if f_ad < f_fix - 0.10:
-            msg = (f"adaptive falls {f_ad:.0%} vs fixed {f_fix:.0%} -- adapts further "
-                   f"than the constant when the constant is not enough")
-        elif comparable and v_ad > v_fix + 0.01:
+        v_none, v_fix, v_ad = st["none"][3], st["fixed"][3], st["adaptive"][3]
+        s_ad = st["adaptive"][4]
+
+        if f_none < 0.05 and f_fix < 0.05 and f_ad < 0.05:
+            msg = (f"no falls in any condition -- no stability problem here. "
+                   f"Beating fixed on speed ({v_ad:.3f} vs {v_fix:.3f}) only shows "
+                   f"fixed is needlessly slow, not that adaptation works.")
+        elif f_ad > f_fix + 0.08:
+            msg = (f"WORSE than fixed on safety: {f_ad:.0%} vs {f_fix:.0%} falls "
+                   f"(mean s={s_ad:.3f} vs 0.700 -- it did not back off enough). "
+                   f"Speed is not a defence.")
+        elif f_ad > f_none + 0.08:
+            msg = (f"WORSE than no adaptation: {f_ad:.0%} vs {f_none:.0%} falls. "
+                   f"The controller is hurting.")
+        elif f_ad < f_fix - 0.08:
+            msg = (f"safer than fixed: {f_ad:.0%} vs {f_fix:.0%} falls -- adapts "
+                   f"further than the constant when the constant is not enough")
+        elif v_ad > v_fix + 0.01:
             msg = (f"same safety ({f_ad:.0%} vs {f_fix:.0%} falls) at higher speed "
                    f"({v_ad:.3f} vs {v_fix:.3f} m/s) -- adaptation earns its keep")
-        elif comparable:
+        else:
             msg = (f"matches fixed on both ({f_ad:.0%} falls, {v_ad:.3f} m/s) -- "
                    f"no advantage over walking conservatively")
-        else:
-            msg = (f"adaptive falls {f_ad:.0%} vs fixed {f_fix:.0%}; speed not "
-                   f"comparable at these fall rates")
         print(f"  {fault:<17}{msg}")
         print(f"  {'':17}(no adaptation: {f_none:.0%} falls)")
 
@@ -164,6 +172,14 @@ def main():
     parser.add_argument("--models_dir", type=str, default="models")
     parser.add_argument("--trials", type=int, default=30)
     parser.add_argument("--fixed_scale", type=float, default=0.70)
+    parser.add_argument("--faults", type=str, default=None,
+                        help="Comma-separated fault types to evaluate.")
+    parser.add_argument("--severities", type=str, default=None,
+                        help="Comma-separated severities, used with a single "
+                             "--faults value. A constant tuned for ONE operating "
+                             "point is close to unbeatable at that point; the "
+                             "claim that adaptation works requires a RANGE no "
+                             "single constant handles well.")
     parser.add_argument("--out", type=str, default="logs/amplitude_eval.csv")
     args = parser.parse_args()
 
@@ -182,6 +198,19 @@ def main():
     else:
         paths = [args.model]
 
+    global FAULTS
+    if args.faults:
+        wanted = {f.strip() for f in args.faults.split(",")}
+        FAULTS = [f for f in FAULTS if f[0] in wanted]
+        if not FAULTS:
+            raise SystemExit(f"No known fault types in {sorted(wanted)}")
+    if args.severities:
+        if len(FAULTS) != 1:
+            raise SystemExit("--severities requires exactly one --faults value")
+        name = FAULTS[0][0]
+        FAULTS = [(name, float(x)) for x in args.severities.split(",")]
+        print(f"Severity range for {name}: {[f[1] for f in FAULTS]}")
+
     all_rows = []
     for path in paths:
         print(f"\n{os.path.basename(path)}")
@@ -199,3 +228,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
