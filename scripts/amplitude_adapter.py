@@ -7,16 +7,13 @@ class AmplitudeAdapter:
         base_scale,
         mode="adaptive",          # "none" | "fixed" | "adaptive"
         fixed_scale=0.70,         # used when mode == "fixed"
-        # 0.60 was binding in every sweep configuration (min_s hit the floor
-        # every time), so the controller had no room left at high severity.
         s_min=0.50,
         s_max=1.00,
-        # Swept on seed 0, actuation_delay(5): "osc" risk reached 0% falls where
-        # every "tilt" configuration stayed at 20-33%. k=1.0 and a slow increase
-        # were the best of the safe configurations.
-        k_threshold=1.0,          # risk threshold = healthy mean + k * healthy sd
-        decrease=0.04,            # multiplicative back-off per step when at risk
-        increase=0.0002,          # additive recovery per step when calm
+        k_threshold=3.0,          # risk threshold = healthy mean + k * healthy sd
+        backoff_rule="proportional",   # "step" | "proportional"
+        decrease=0.04,            # "step": fixed multiplicative back-off per step
+        prop_gain=0.05,           # "proportional": back-off per unit relative excess
+        increase=0.0015,          # additive recovery per step when calm
         risk_mode="osc",          # "tilt" | "osc"
         osc_weight=3.0,           # weight on tilt VARIABILITY when risk_mode="osc"
         smooth_window=30,         # ~1 stride, so gait wobble is not read as risk
@@ -30,7 +27,9 @@ class AmplitudeAdapter:
         self.fixed_scale = float(fixed_scale)
         self.s_min, self.s_max = float(s_min), float(s_max)
         self.k = float(k_threshold)
+        self.backoff_rule = backoff_rule
         self.decrease = float(decrease)
+        self.prop_gain = float(prop_gain)
         self.increase = float(increase)
         self.risk_mode = risk_mode
         self.osc_weight = float(osc_weight)
@@ -50,6 +49,7 @@ class AmplitudeAdapter:
 
     # per step 
     def apply(self, env):
+        """Set the environment's joint-space action scale for this step."""
         env._action_scale = self.base_scale * self.s
         self.s_trace.append(self.s)
         return self.s
@@ -59,7 +59,7 @@ class AmplitudeAdapter:
         if self.mode in ("none", "fixed"):
             return
 
-        # Tilt away from upright. 0 when level.
+        # Tilt away from upright. 0 when level
         tilt = 1.0 - float(info.get("upright_alignment", 1.0))
         self._risk_hist.append(tilt)
         w = min(self.smooth_window, len(self._risk_hist))
@@ -81,7 +81,12 @@ class AmplitudeAdapter:
                                  self.min_threshold)
 
         if risk_s > self.threshold:
-            self.s = max(self.s_min, self.s * (1.0 - self.decrease))
+            if self.backoff_rule == "proportional":
+                # Back off in proportion to HOW FAR risk exceeds the threshold
+                excess = (risk_s / self.threshold) - 1.0
+                self.s = max(self.s_min, self.s * (1.0 - self.prop_gain * excess))
+            else:
+                self.s = max(self.s_min, self.s * (1.0 - self.decrease))
             self.n_backoff += 1
         else:
             self.s = min(self.s_max, self.s + self.increase)
@@ -95,6 +100,7 @@ class AmplitudeAdapter:
             "min_scale": round(float(np.min(self.s_trace)), 4) if self.s_trace else None,
             "threshold": round(self.threshold, 5) if self.threshold is not None else None,
             "risk_mode": self.risk_mode,
+            "backoff_rule": self.backoff_rule,
             "backoff_steps": self.n_backoff,
             "steps": self.step_count,
         }
