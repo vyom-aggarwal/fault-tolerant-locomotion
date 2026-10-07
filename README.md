@@ -17,7 +17,9 @@ Everything runs in simulation (PyBullet), on CPU, on a laptop.
 | Baseline A (fault, *no* adaptation) evaluation | **Built + run** — see [Results](#results-baseline-a) |
 | Across-seed aggregation & headroom analysis | **Built + run** — [`logs/across_seed_summary.csv`](logs/across_seed_summary.csv) |
 | Fault severity sweep | Built, **not yet run across seeds** |
-| Residual adaptation module | **Not built yet** ← *the actual contribution* |
+| Residual adaptation prototype (integral / RLS correction) | **Built, prototyped** — [`scripts/adaptation.py`](scripts/adaptation.py); authority probes motivated moving beyond pure offset correction (see [Adaptation work](#adaptation-work-so-far)) |
+| Adaptive gait-amplitude controller | **Built, tuned on `seed_0`** — [`scripts/amplitude_adapter.py`](scripts/amplitude_adapter.py); multi-seed results not yet recorded |
+| Adaptive-vs-fixed frontier comparison | **Built** — [`scripts/frontier_compare.py`](scripts/frontier_compare.py); results not yet recorded here |
 | Baseline B (full policy retraining) | **Not built yet** |
 | Held-out fault split for H3 | **Not yet fixed** — must be chosen before the adaptation module exists |
 
@@ -38,6 +40,7 @@ sensor-side faults, with no overlap — an empirical basis for the physics/senso
 - [The environment](#the-environment)
 - [The fault model](#the-fault-model)
 - [Baseline A protocol](#baseline-a-protocol)
+- [Adaptation work so far](#adaptation-work-so-far)
 - [Full reproduction pipeline](#full-reproduction-pipeline)
 - [How the code fits together](#how-the-code-fits-together)
 - [Known limitations & open issues](#known-limitations--open-issues)
@@ -236,6 +239,19 @@ scripts/
   aggregate_seeds.py        summarize ACROSS seeds + headroom analysis
   run_multiseed.py          orchestrates the whole per-seed pipeline
 
+  -- adaptation research (after Baseline A) --
+  adaptation.py             ResidualAdapter + RLSEstimator: bounded joint-space
+                            correction from an influence matrix (library)
+  fit_influence_matrix.py   identify the action -> body-velocity influence matrix
+                            per policy, with a split-half agreement check
+  probe_authority.py        how much can a joint-space offset change body velocity?
+  measure_fault_deficit.py  settled post-fault velocity deficit vs. offset authority
+  probe_amplitude.py        does scaling gait amplitude recover velocity / stability?
+  amplitude_adapter.py      AmplitudeAdapter: none | fixed | adaptive action scale (library)
+  eval_amplitude.py         none vs fixed vs adaptive, per fault/severity, one or all seeds
+  sweep_adapter.py          grid over adapter hyperparameters on one fault
+  frontier_compare.py       fall-rate vs speed Pareto front, fixed scales vs adaptive
+
 models/
   seed_0.zip .. seed_9.zip           trained base policies
   seed_N_trainconfig.json            provenance: timesteps, ent_coef, n_envs, seed
@@ -249,6 +265,9 @@ results/                    generated, not committed
   manifest.json             per-seed status, gait-check metrics, failure_mode
   seed_*/baseline_fault_results.csv   trial-level Baseline A data
 ```
+
+Adaptation scripts write to `logs/` by default (`logs/amplitude_eval.csv`,
+`logs/frontier.csv`).
 
 **Provenance sidecars.** Every training run writes `models/seed_N_trainconfig.json` recording the
 timesteps, entropy coefficient, parallel-env count, and seed used. `run_multiseed.py` reads it
@@ -452,6 +471,61 @@ are compared on matched initial conditions.
 
 ---
 
+## Adaptation work so far
+
+Baseline A showed the faults leave headroom; the work since then has been finding an adaptation
+mechanism that uses it. Three approaches have been built, in order. All sit on top of the frozen
+base policy; nothing is retrained.
+
+**1. Residual correction (`adaptation.py`).** `ResidualAdapter` adds a bounded joint-space offset
+`delta` (|delta| ≤ `delta_max` per joint) to the policy's action. An integral controller drives
+smoothed body velocity toward the command through a ridge pseudo-inverse of an influence matrix
+`B` (action → forward/lateral/yaw velocity). `mode="fixed"` uses an offline-fitted `B`
+(`fit_influence_matrix.py`); `mode="rls"` refines it online with a forgetting-factor
+`RLSEstimator` and small dither. `probe_authority.py` and `measure_fault_deficit.py` compare the
+velocity a bounded offset can buy back against the measured post-fault deficit; those probes
+motivated moving on from pure offset correction.
+
+**2. Gait-amplitude scaling (`amplitude_adapter.py`).** Instead of adding a correction, scale the
+policy's joint-action amplitude (`env._action_scale * s`), trading speed for stability.
+`probe_amplitude.py` measures the effect of fixed scales (0.70–1.30) per fault. Three modes:
+
+- `none`: `s = 1` (Baseline A behaviour).
+- `fixed`: constant `s` (default 0.70).
+- `adaptive`: `s ∈ [0.5, 1.0]` driven by an online risk signal.
+
+The adaptive rule needs **no fault detector and no per-policy tuning**. It calibrates on the
+robot's own first 2 s of walking and sets the risk threshold to `mean + k·sd` of healthy risk.
+Risk is smoothed torso tilt (`1 − upright_alignment`) plus `osc_weight` × its short-window
+standard deviation (`risk_mode="osc"`), because delay-induced instability appears as oscillation
+before it appears as lean. When risk exceeds the threshold, `s` backs off, proportionally to the
+relative excess by default (`backoff_rule="proportional"`, or a fixed multiplicative `"step"`),
+and otherwise recovers additively by `increase` per step.
+
+**3. Is adaptation worth it? (`frontier_compare.py`, `eval_amplitude.py`).** The honest control for
+the adaptive controller is a *constant* reduced gait. `frontier_compare.py` sweeps fixed scales
+(1.0–0.5) and adaptive thresholds `k` on one fault, then reports the Pareto front on fall rate
+vs speed and says whether adaptive, fixed, or neither dominates. `eval_amplitude.py` runs
+`none`/`fixed`/`adaptive` on the five Baseline A faults with the same trial protocol and recovery
+criterion, writing `logs/amplitude_eval.csv`; `--severities` evaluates a range and `--all` loops
+over seeds. `sweep_adapter.py` grid-searches `risk_mode`, `k_threshold`, `increase`, and
+`smooth_window`.
+
+```bash
+python scripts/probe_amplitude.py --model models/seed_0
+python scripts/sweep_adapter.py --model models/seed_0 --fault actuation_delay --severity 5
+python scripts/frontier_compare.py --model models/seed_0 --fault actuation_delay --severity 5
+python scripts/eval_amplitude.py --model models/seed_0 --trials 30
+```
+
+**Status and caveats.** Adapter defaults were tuned from a sweep on `seed_0` and
+`actuation_delay`, so evaluating them on that same seed and fault is in-sample; results on other
+seeds and faults are what count. No adaptation results are reported in this README yet. Run the
+scripts above and record them here. The held-out fault split (H3) should be settled before any
+held-out number is looked at.
+
+---
+
 ## Full reproduction pipeline
 
 ### Cheap sanity checks first
@@ -599,6 +673,12 @@ the environment imports nothing from scripts.
  aggregate_seeds.py  ── reduces ──▶       all seeds' trials  → logs/across_seed_summary.csv
 ```
 
+The adaptation scripts follow the same rule: `adaptation.py` and `amplitude_adapter.py` are
+libraries holding the controller logic; `eval_amplitude.py`, `sweep_adapter.py`,
+`frontier_compare.py`, and the `probe_*` / `fit_*` / `measure_*` scripts are drivers that import
+the environment, one adapter, and (for the amplitude scripts) `baseline_fault_eval`'s onset and
+recovery-scoring helpers.
+
 ---
 
 ## Known limitations & open issues
@@ -645,7 +725,15 @@ Stated plainly because they determine what the next round of experiments has to 
 9. **Single robot, flat terrain, simulation only.** No terrain variation, no domain
    randomization, no sim-to-real claim is being made.
 
-10. **`check_reset_pose.py` prints "expected ~0.30" for the reset height.** The correct settled
+10. **Adapter tuned in-sample.** `AmplitudeAdapter` defaults came from a sweep on one seed and
+    fault. Treat those numbers as development results and re-evaluate on the remaining seeds.
+
+11. **Amplitude scaling is not residual adaptation.** The adaptive controller changes gait
+    amplitude, not a learned correction; it may win by simply walking more cautiously, which is
+    why `frontier_compare.py` pits it against constant scaling. It is a candidate mechanism, not
+    yet the residual module the hypotheses describe.
+
+12. **`check_reset_pose.py` prints "expected ~0.30" for the reset height.** The correct settled
     standing height is ~0.558 m. The printed measurement is right; the parenthetical hint is
     stale.
 
@@ -666,7 +754,12 @@ Stated plainly because they determine what the next round of experiments has to 
       hold out `actuation_delay` and `sensor_dropout`. Both categories are represented in the
       held-out set, and the most structurally distinct fault (temporal, not magnitude) is held
       out.
-- [ ] Implement the residual adaptation module on the `_apply_fault_to_action` hook.
+- [x] Prototype a residual (integral / RLS) correction and probe its authority.
+- [x] Prototype an adaptive gait-amplitude controller; add a fixed-scale control, tuning sweep,
+      and Pareto-front comparison.
+- [ ] Run `frontier_compare.py` and `eval_amplitude.py --all`, and record the results here.
+- [ ] Decide the final adaptation mechanism (residual module on the `_apply_fault_to_action`
+      hook, amplitude scaling, or both) from the frontier results.
 - [ ] Implement Baseline B (full policy retraining post-fault) for the upper-bound comparison.
 - [ ] Add a domain-randomization baseline — reviewers will ask why randomized training isn't
       sufficient on its own.
