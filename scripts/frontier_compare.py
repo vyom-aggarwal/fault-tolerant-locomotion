@@ -60,7 +60,7 @@ def measure(model, env, base_scale, fault, severity, seeds, mode, **kw):
     vels = [r["vel"] for r in res if r["vel"] is not None]
     return {"n": n,
             "fall_rate": sum(r["fell"] for r in res) / n,
-            # survivors only
+            # survivors only; comparable across points of similar fall rate
             "speed": float(np.mean(vels)) if vels else float("nan"),
             "mean_s": float(np.mean([r["mean_s"] for r in res]))}
 
@@ -85,8 +85,16 @@ def main():
     parser.add_argument("--fault", type=str, default="actuation_delay")
     parser.add_argument("--severity", type=float, default=5)
     parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument("--fixed_scales", type=str, default=None,
+                        help="Comma-separated fixed scales. A coarse grid lets an "
+                             "adaptive point reach the front merely by filling a "
+                             "sampling gap; sample finely where adaptive points land.")
     parser.add_argument("--out", type=str, default="logs/frontier.csv")
     args = parser.parse_args()
+
+    global FIXED_SCALES
+    if args.fixed_scales:
+        FIXED_SCALES = [float(x) for x in args.fixed_scales.split(",")]
 
     model = PPO.load(args.model)
     env = make_env_from_model_path(args.model, render=False)
