@@ -13,7 +13,6 @@ class AmplitudeAdapter:
         backoff_rule="proportional",   # "step" | "proportional"
         decrease=0.04,            # "step": fixed multiplicative back-off per step
         prop_gain=0.05,           # "proportional": back-off per unit relative excess
-        increase=0.0015,          # additive recovery per step when calm
         risk_mode="osc",          # "tilt" | "osc"
         osc_weight=3.0,           # weight on tilt VARIABILITY when risk_mode="osc"
         smooth_window=30,         # ~1 stride, so gait wobble is not read as risk
@@ -59,7 +58,7 @@ class AmplitudeAdapter:
         if self.mode in ("none", "fixed"):
             return
 
-        # Tilt away from upright. 0 when level
+        # Tilt away from upright. 0 when level; the fall threshold is 0.5.
         tilt = 1.0 - float(info.get("upright_alignment", 1.0))
         self._risk_hist.append(tilt)
         w = min(self.smooth_window, len(self._risk_hist))
@@ -83,7 +82,6 @@ class AmplitudeAdapter:
         if risk_s > self.threshold:
             if self.backoff_rule == "proportional":
                 # Back off in proportion to HOW FAR risk exceeds the threshold
-                excess = (risk_s / self.threshold) - 1.0
                 self.s = max(self.s_min, self.s * (1.0 - self.prop_gain * excess))
             else:
                 self.s = max(self.s_min, self.s * (1.0 - self.decrease))
