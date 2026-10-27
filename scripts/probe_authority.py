@@ -13,6 +13,15 @@ from envs.quadruped_env import make_env_from_model_path
 LABELS = ("forward", "lateral", "yaw")
 
 
+# Settled post-fault velocity deficits from the corrected Baseline A
+SETTLED_DEFICIT = {
+    "torque_limit": 0.117,
+    "joint_lock": 0.137,
+    "sensor_dropout": 0.019,
+    "sensor_noise": 0.009,
+}
+
+
 def ridge_pinv(Bm, lam=0.05):
     return Bm.T @ np.linalg.inv(Bm @ Bm.T + lam * np.eye(Bm.shape[0]))
 
@@ -86,7 +95,7 @@ def main():
     print(f"Probing control authority: {args.episodes} episodes, one constant "
           f"offset each (std {args.scale})\n")
 
-    # Baseline
+    # Baseline: no offset, repeated, to measure how much the outputs vary on their own
     base_env = make_env_from_model_path(args.model, render=False, randomize_init=True)
     base_runs = []
     for k in range(8):
@@ -139,7 +148,7 @@ def main():
     if rel is not None:
         print(f"  split-half rel.diff = {rel:.3f}")
 
-    # direct authority test
+    # direct authority test 
     print("\n" + "-" * 70)
     print("DIRECT TEST: request a forward correction, measure what is delivered")
     print(f"  (delta bounded at +/-{args.delta_max} per joint, as in ResidualAdapter)")
@@ -160,15 +169,18 @@ def main():
               f"{delivered:>+11.4f}{frac:>9.0%}")
     max_delivered = float(np.nanmax(delivered_abs)) if delivered_abs else 0.0
     env2.close()
-    print("\n  Fault-induced drops to compensate: torque_limit ~0.27 m/s, "
-          "joint_lock ~0.22 m/s,")
-    print("  sensor faults ~0.12 m/s. If delivered correction falls well short of")
-    print("  those, a DC offset cannot restore commanded speed regardless of how")
-    print("  well B is identified.")
+    print("\n  Settled deficits to compensate (Baseline A, 10 seeds): "
+          f"torque_limit {SETTLED_DEFICIT['torque_limit']:.3f} m/s, "
+          f"joint_lock {SETTLED_DEFICIT['joint_lock']:.3f} m/s,")
+    print(f"  sensor faults {SETTLED_DEFICIT['sensor_noise']:.3f}-"
+          f"{SETTLED_DEFICIT['sensor_dropout']:.3f} m/s. If the delivered correction "
+          "falls well short,")
+    print("  a DC offset cannot restore commanded speed regardless of how well B")
+    print("  is identified.")
 
-    WORST_DROP = 0.27      # largest fault-induced velocity drop to undo (m/s)
+    WORST_DROP = max(SETTLED_DEFICIT["torque_limit"], SETTLED_DEFICIT["joint_lock"])
 
-    # authority on a damaged robot 
+    # authority on a DAMAGED robot 
     print("\n" + "-" * 70)
     print("AUTHORITY UNDER FAULT (paired: same seed, same fault, delta on vs off)")
     env3 = make_env_from_model_path(args.model, render=False, randomize_init=False)
@@ -220,8 +232,10 @@ def main():
     elif best_fault_gain > 0.5 * WORST_DROP:
         print("  -> Sufficient under fault even though it looked marginal when healthy.")
     else:
-        print("  -> Still insufficient under fault. This is a genuine limit of DC")
-        print("     joint offsets, not a measurement artefact.")
+        print(f"  -> Covers {best_fault_gain / WORST_DROP:.0%} of the largest settled "
+              f"deficit under fault, about")
+        print("     the same as when healthy. The ceiling is a property of DC joint")
+        print("     offsets, not an artefact of measuring on an intact policy.")
 
     # ---- verdict ----
     print("\n" + "=" * 70)
@@ -232,7 +246,8 @@ def main():
     fwd_weak = (cos is not None and cos[0] > 0.35 and r2[0] > 0.2)
     others_ok = (cos is not None and cos[1] > 0.6 and cos[2] > 0.6)
     print(f"Best delivered forward correction: {max_delivered:+.4f} m/s "
-          f"({max_delivered/WORST_DROP:.0%} of the worst fault-induced drop)\n")
+          f"({max_delivered/WORST_DROP:.0%} of the largest settled deficit, "
+          f"{WORST_DROP:.3f} m/s)\n")
 
     if not sufficient and not partial:
         print("INSUFFICIENT AUTHORITY. Even at the delta bound, a constant joint")

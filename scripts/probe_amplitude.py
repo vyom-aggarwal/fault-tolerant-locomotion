@@ -16,13 +16,16 @@ CHANGE_STEP = 150
 MEASURE_FROM = 300
 MEASURE_TO = 800
 MAX_STEPS = 1000
-DC_OFFSET_AUTHORITY = 0.055   
-MEASURED_DEFICIT = {"torque_limit": 0.106, "joint_lock": 0.099, "actuation_delay": 0.197}
+# Best forward change a constant joint offset delivered, as measured by probe_authority.py ON SEED 0
+DC_OFFSET_AUTHORITY = 0.055
+
+# Settled post-fault velocity deficits the channel must close
+MEASURED_DEFICIT = {"torque_limit": 0.117, "joint_lock": 0.137, "actuation_delay": 0.197}
 
 
 def rollout(model, env, seed, base_scale, scale=1.0, mode="joint",
             fault=None, severity=1.0):
-    env._action_scale = base_scale
+    env._action_scale = base_scale            # restore: reset() does not
     obs, info = env.reset(seed=seed)
     vels, sat = [], []
     fell = False
@@ -91,6 +94,10 @@ def print_table(res, trials, label):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/seed_0")
+    parser.add_argument("--offset_authority", type=float, default=None,
+                        help="This policy's best constant-offset correction, from "
+                             "probe_authority.py on the SAME policy. Defaults to the "
+                             "seed-0 value.")
     parser.add_argument("--trials", type=int, default=12,
                         help="Seeds per (condition, scale). Paired across scales.")
     parser.add_argument("--no_randomize", action="store_true",
@@ -98,6 +105,14 @@ def main():
                              "it makes faults that affect all joints produce "
                              "identical trials, so n is effectively 1.")
     args = parser.parse_args()
+
+    global DC_OFFSET_AUTHORITY
+    if args.offset_authority is not None:
+        DC_OFFSET_AUTHORITY = args.offset_authority
+    else:
+        print(f"NOTE: comparing against the SEED-0 offset authority "
+              f"({DC_OFFSET_AUTHORITY} m/s). For a\n      held-out policy, pass its own "
+              f"value with --offset_authority.\n")
 
     model = PPO.load(args.model)
     env = make_env_from_model_path(args.model, render=False,
@@ -136,7 +151,7 @@ def main():
         print_table(res, args.trials, f"{fname} (severity {fsev})")
     env.close()
 
-    # verdict 
+    # ---- verdict ----
     print("\n" + "=" * 74)
     print("AMPLITUDE vs OFFSET, judged against the measured deficits")
     print("=" * 74)
@@ -160,6 +175,7 @@ def main():
         print(f"  {label:<20}{deficit:>9.3f}{g_best:>+10.4f}{c_best:>7.2f}"
               f"{cover:>8.0%}{vs_off:>10.1f}x")
 
+    # Stability: only claim an effect if fall counts actually differ across scales
     print(f"\n  {'fault':<20}{'falls @1.0':>12}{'fewest falls':>14}{'at scale':>10}")
     stab_rows = []
     for (fname, fsev), res in fault_results.items():
