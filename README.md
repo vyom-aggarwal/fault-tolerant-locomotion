@@ -13,20 +13,22 @@ Everything runs in simulation (PyBullet), on CPU, on a laptop.
 | Component | State |
 |---|---|
 | Fault-injectable quadruped environment | **Built** — [`envs/quadruped_env.py`](envs/quadruped_env.py) |
-| PPO base policy, trained across 10 seeds @ 1.5M steps | **Built + run** — `models/seed_0..9.zip` |
-| Baseline A (fault, *no* adaptation) evaluation | **Built + run** — see [Results](#results-baseline-a) |
+| PPO base policy, 10 seeds @ 1.5M steps | **Built + run** — all 10 converge, `models/seed_0..9.zip` |
+| Baseline A (fault, *no* adaptation), 700-step window | **Built + run** — see [Results](#results-baseline-a) |
 | Across-seed aggregation & headroom analysis | **Built + run** — [`logs/across_seed_summary.csv`](logs/across_seed_summary.csv) |
-| Fault severity sweep | Built, **not yet run across seeds** |
-| Residual adaptation prototype (integral / RLS correction) | **Built, prototyped** — [`scripts/adaptation.py`](scripts/adaptation.py); authority probes motivated moving beyond pure offset correction (see [Adaptation work](#adaptation-work-so-far)) |
-| Adaptive gait-amplitude controller | **Built, tuned on `seed_0`** — [`scripts/amplitude_adapter.py`](scripts/amplitude_adapter.py); multi-seed results not yet recorded |
-| Adaptive-vs-fixed frontier comparison | **Built** — [`scripts/frontier_compare.py`](scripts/frontier_compare.py); results not yet recorded here |
+| Constant-offset residual correction (integral / RLS) | **Built + probed on seed 0** — covers a *partial* share of the deficit; replication on seeds 1, 4, 7 pending |
+| Adaptive gait-amplitude controller (AIMD on tilt) | **Built, tested, negative result** — a constant amplitude reduction beats it on held-out seeds |
+| Paired statistical analysis of the comparison | **Built + run** — [`scripts/analyze_deployment.py`](scripts/analyze_deployment.py) |
 | Baseline B (full policy retraining) | **Not built yet** |
-| Held-out fault split for H3 | **Not yet fixed** — must be chosen before the adaptation module exists |
+| Held-out fault split for H3 | **Not yet fixed** |
 
-Baseline A is complete and the faults separate cleanly: unadapted recovery ranges from **0%**
-(`actuation_delay`) to **86.7%** (`sensor_noise`), leaving real headroom for an adaptation method
-to demonstrate an effect. All three actuation-side faults are less recoverable than both
-sensor-side faults, with no overlap — an empirical basis for the physics/sensor split used in H3.
+**Where the project stands.** Baseline A leaves real headroom (unadapted recovery from 0% for
+`actuation_delay` to 65% for `sensor_noise`). The first adaptation mechanism tried, a reactive
+amplitude controller, does not beat simply walking with a constant, smaller gait amplitude: on
+held-out seeds 1–9, `fixed 0.80` is faster than every adaptive configuration with intervals
+excluding zero, and no difference in falls was detected. The open question is whether any
+*adaptive* method (direct delay estimation, a fault-conditioned policy, or a better residual) can
+beat a constant. The residual module that H1–H3 describe is still to be built.
 
 ---
 
@@ -79,78 +81,71 @@ invalidates the generalization claim.
 
 ## Results (Baseline A)
 
-Base policy, **no adaptation**, fault injected mid-episode.
+Base policy, **no adaptation**, fault injected mid-episode. Numbers below are from the corrected
+protocol: a 700-step (11.7 s) post-fault window and a settled-deficit metric (see
+[Baseline A protocol](#baseline-a-protocol)). Earlier numbers from a 300-step window are superseded.
 
 ### Training reliability
 
 | | |
 |---|---|
 | Seeds attempted | 10 (seeds 0–9), 1.5M timesteps each |
-| Converged to a usable gait | **6 / 10 (60%)** — seeds 0, 2, 4, 6, 7, 8 |
-| Excluded | seeds 1, 3, 5, 9 |
-| Forward speed, converged seeds | **0.585 ± 0.053 m/s** against a 0.5 m/s command |
-| Wall-clock, full pipeline | ~18.6 h (train + evaluate, 10 seeds, laptop CPU) |
+| Converged to a usable gait | **10 / 10** (`results/manifest.json`) |
+| Forward speed | **0.544 ± 0.039 m/s** against a 0.5 m/s command |
+| Influence matrices | `models/seed_N_influence.npz`, fitted for all 10 seeds |
 
-A 60% convergence rate is a reported result, not a defect to hide: it characterizes how reliably
-this training setup produces a usable policy. The two failure modes are distinct and recorded
-separately in `results/manifest.json` as `failure_mode`:
-
-- `off_target` — walks stably for the full episode but does not track the commanded velocity
-  (e.g. seed 1 at 0.308 m/s, 38% tracking error).
-- `unstable` — tracks velocity acceptably but falls before the episode ends.
+All ten seeds pass the gait check, so every analysis below uses all ten. Non-converged seeds, if
+they ever occur again, are still excluded by `aggregate_seeds.py` via the manifest, with the
+failure recorded as `failure_mode` (`off_target` or `unstable`).
 
 ### Fault response
 
-**The unit of analysis is the seed.** Each of the 6 converged seeds contributes one number per
-metric from 100 trials; the ± is the spread *across seeds*, not across trials. Non-converged
-seeds are excluded by `aggregate_seeds.py`, which reads `results/manifest.json` rather than
-trusting whatever CSVs happen to be on disk.
+**The unit of analysis is the seed.** Each of the 10 seeds contributes one number per metric
+from about 100 trials; the ± is the spread *across seeds*, not across trials.
 
-| Fault (severity) | Degraded | Velocity drop | **Recovery** | Fall rate | Recovery time (s) | Post-fault distance (m) |
+| Fault (severity) | Degraded | Velocity drop | **Recovery** | Fall rate | Settled deficit (m/s) | Recovery time (s) |
 |---|---|---|---|---|---|---|
-| `actuation_delay` (10 steps) | 100.0% ± 0.0% | 85.9% ± 12.7% | **0.0% ± 0.0%** | 0.0% ± 0.0% | — | 1.565 ± 0.220 |
-| `torque_limit` (0.2×) | 95.2% ± 5.3% | 55.1% ± 7.7% | **41.2% ± 3.0%** | **33.2% ± 10.3%** | 1.864 ± 0.618 | 1.880 ± 0.211 |
-| `joint_lock` | 91.2% ± 2.6% | 44.9% ± 4.2% | **54.9% ± 18.6%** | 0.0% ± 0.0% | 2.222 ± 0.628 | 2.432 ± 0.185 |
-| `sensor_dropout` | 95.7% ± 5.0% | 28.3% ± 3.2% | **81.4% ± 14.3%** | 0.0% ± 0.0% | 2.077 ± 0.940 | 3.041 ± 0.178 |
-| `sensor_noise` (σ = 0.3) | 83.2% ± 14.9% | 23.7% ± 3.6% | **86.7% ± 5.6%** | 0.0% ± 0.0% | 2.227 ± 0.451 | 3.154 ± 0.138 |
+| `actuation_delay` (10 steps) | 99.9% | 100.2% | **0.0% ± 0.0%** | 97.7% ± 2.7% | 0.321 ± 0.048 | — |
+| `torque_limit` (0.2×) | 84.2% | 64.0% | **20.6% ± 6.2%** | 40.8% ± 8.6% | 0.117 ± 0.048 | 6.64 ± 0.47 |
+| `joint_lock` | 85.2% | 57.5% | **29.6% ± 4.8%** | 8.1% ± 12.3% | 0.137 ± 0.035 | 7.37 ± 0.48 |
+| `sensor_dropout` | 60.3% | 40.8% | **56.9% ± 10.0%** | 5.8% ± 9.3% | 0.019 ± 0.014 | 6.84 ± 0.47 |
+| `sensor_noise` (σ = 0.3) | 59.4% | 38.7% | **65.0% ± 13.1%** | 4.1% ± 9.0% | 0.009 ± 0.014 | 6.57 ± 0.59 |
 
-*Recovery rate is **conditional on degradation** — of the trials where the fault measurably
-slowed the robot, the fraction that returned to pre-fault speed and held it. Trials the fault
-never affected are reported under "Degraded" instead of being scored as recoveries.*
+*Recovery rate is **conditional on degradation**: of the trials where the fault measurably slowed
+the robot, the fraction that returned to pre-fault speed and held it. Settled deficit is
+pre-fault speed minus the speed in the settled part of the window.*
 
-Per-seed recovery rates (seeds 0, 2, 4, 6, 7, 8):
+Per-seed recovery rates (seeds 0–9):
 
 ```
-actuation_delay    0%   0%   0%   0%   0%   0%
-torque_limit      39%  39%  39%  45%  45%  41%
-joint_lock        49%  64%  76%  48%  68%  24%     <- high spread
-sensor_dropout    93%  91%  91%  55%  81%  77%
-sensor_noise      88%  85%  78%  95%  90%  84%
+actuation_delay   0%    0%    0%    0%    0%    0%    0%    0%    0%    0%
+torque_limit     27%   21%   24%   17%   16%   17%   26%   16%   10%   30%
+joint_lock       37%   25%   39%   30%   30%   27%   29%   26%   24%   30%
+sensor_dropout   53%   49%   63%   67%   62%   42%   66%   56%   42%   68%
+sensor_noise     79%   56%   69%   59%   63%   62%   77%   73%   36%   78%
 ```
 
 ### What these numbers say
 
-1. **Actuation-side faults are strictly harder than sensor-side faults.** Ordered by
-   recoverability: `actuation_delay` (0%) < `torque_limit` (41.2%) < `joint_lock` (54.9%) <
-   `sensor_dropout` (81.4%) < `sensor_noise` (86.7%). All three physics faults fall below both
-   sensor faults with no overlap. The physics/sensor distinction is therefore an empirical
-   property of the system, not just a labelling convention — which is what makes it a
-   defensible axis for the H3 generalization split.
+1. **Actuation-side faults are harder than sensor-side faults.** Ordered by recoverability:
+   `actuation_delay` (0%) < `torque_limit` (20.6%) < `joint_lock` (29.6%) < `sensor_dropout`
+   (56.9%) < `sensor_noise` (65.0%). The physics/sensor split is an empirical property of the
+   system, which makes it a defensible axis for the H3 split. Sensor faults leave settled deficits
+   of only 0.009–0.020 m/s, so there is little for any method to recover there.
 
-2. **`torque_limit` is the highest-power test case.** 41.2% ± 3.0 across six seeds — moderate
-   headroom combined with very low between-seed variance. It is also the only fault that causes
-   falls (33.2%); every other fault degrades the gait without toppling the robot.
+2. **The longer window changed the picture.** With the 700-step window, recovery rates fell
+   sharply (e.g. `sensor_noise` 86.7% → 65.0%, `joint_lock` 54.9% → 29.6%) because early returns
+   to speed often do not hold. `actuation_delay` is now also a fall problem: **97.7%** of trials
+   end in a fall, where the 300-step window showed 0%.
 
-3. **`actuation_delay` may be saturated.** 0% recovery on every seed and every trial, with an
-   85.9% velocity drop and no falls: the robot slows to near-zero and never returns within the
-   5 s window, but stays upright. This is either the most dramatic H1 demonstration available or
-   a fault so severe that no method could discriminate. **The severity sweep decides which**, and
-   has not been run yet.
+3. **`torque_limit` is the most dangerous non-delay fault.** It has a 40.8% fall rate and a
+   0.117 m/s settled deficit with the lowest recovery of the non-delay faults (20.6%).
+   `joint_lock` has the largest settled deficit among them (0.137 m/s) but rarely topples the
+   robot (8.1%). Between-seed spread is now modest for both; `sensor_noise` varies most (36–79%).
 
-4. **`joint_lock` varies genuinely across seeds** (24–76%). This survived the exclusion of
-   non-converged seeds, so it reflects real policy-to-policy variation — some learned gaits
-   tolerate a frozen joint, others do not. `aggregate_seeds.py` flags it automatically when the
-   per-seed spread exceeds 40 points.
+4. **`actuation_delay` is saturated at severity 10.** It slows the robot to near zero or
+   topples it on every seed. The severity sweep and `eval_amplitude`/deployment severities
+   (2–20) are what characterize it; see [Adaptation work](#adaptation-work-so-far).
 
 ---
 
@@ -251,6 +246,9 @@ scripts/
   eval_amplitude.py         none vs fixed vs adaptive, per fault/severity, one or all seeds
   sweep_adapter.py          grid over adapter hyperparameters on one fault
   frontier_compare.py       fall-rate vs speed Pareto front, fixed scales vs adaptive
+  measure_latency.py        detection / safe-scale / fall timing after fault onset
+  deployment_compare.py     one committed config across severities 2-20, per policy
+  analyze_deployment.py     paired Wilcoxon + Holm + bootstrap on deployment.csv
 
 models/
   seed_0.zip .. seed_9.zip           trained base policies
@@ -266,8 +264,9 @@ results/                    generated, not committed
   seed_*/baseline_fault_results.csv   trial-level Baseline A data
 ```
 
-Adaptation scripts write to `logs/` by default (`logs/amplitude_eval.csv`,
-`logs/frontier.csv`).
+Adaptation scripts write to `logs/` by default (`logs/amplitude_eval.csv`, `logs/frontier.csv`,
+`logs/deployment.csv`); `logs/ad_sweep.csv` and `logs/sweep_seed0.csv` hold severity-sweep output.
+`models/seed_N_influence.npz` holds each policy's fitted influence matrix.
 
 **Provenance sidecars.** Every training run writes `models/seed_N_trainconfig.json` recording the
 timesteps, entropy coefficient, parallel-env count, and seed used. `run_multiseed.py` reads it
@@ -414,10 +413,14 @@ Implemented in [`scripts/baseline_fault_eval.py`](scripts/baseline_fault_eval.py
 
 | Phase | Steps | What happens |
 |---|---|---|
-| Pre-fault | 0 – 199 (3.3 s) | policy walks; trial is **discarded** if it falls here |
-| Baseline measurement | last 50 pre-fault steps | `baseline_vel` = mean forward velocity |
-| Injection | step 200 | `trigger_fault(type, severity)`, random joint |
-| Post-fault window | 300 steps (5 s) | degradation, recovery, and falls are scored |
+| Pre-fault | 0 – onset (random in 150–250) | policy walks; trial is **discarded** if it falls here |
+| Baseline measurement | last 120 pre-fault steps | `baseline_vel` = mean forward velocity |
+| Injection | onset step | `trigger_fault(type, severity)`, random joint |
+| Post-fault window | 700 steps (11.7 s) | degradation, recovery, settled deficit, and falls are scored |
+
+The window was extended from 300 to 700 steps so that "recovered" must *hold* and falls that take
+several seconds to develop (notably under `actuation_delay`) are observed. The onset is drawn per
+trial from the trial seed, so every candidate evaluated with the same seed sees the same onset.
 
 ### How recovery is scored
 
@@ -460,7 +463,7 @@ torque_limit 0.2 · joint_lock 1.0 · actuation_delay 10 · sensor_dropout 1.0 �
 
 ```python
 torque_limit     0.5, 0.3, 0.2, 0.1, 0.05
-actuation_delay  5, 10, 20, 40
+actuation_delay  1, 2, 3, 5, 10, 20
 sensor_noise     0.1, 0.3, 0.6, 1.0
 joint_lock       (single point; use --n_joints for severity)
 sensor_dropout   (single point; use --n_joints for severity)
@@ -473,56 +476,105 @@ are compared on matched initial conditions.
 
 ## Adaptation work so far
 
-Baseline A showed the faults leave headroom; the work since then has been finding an adaptation
-mechanism that uses it. Three approaches have been built, in order. All sit on top of the frozen
-base policy; nothing is retrained.
+Baseline A showed the faults leave headroom; the work since then asks which adaptation mechanism
+can use it. Everything sits on the frozen base policy; nothing is retrained. The short version:
+**a constant, reduced gait amplitude is a strong baseline that the adaptive controller does not
+beat.**
 
-**1. Residual correction (`adaptation.py`).** `ResidualAdapter` adds a bounded joint-space offset
-`delta` (|delta| ≤ `delta_max` per joint) to the policy's action. An integral controller drives
-smoothed body velocity toward the command through a ridge pseudo-inverse of an influence matrix
-`B` (action → forward/lateral/yaw velocity). `mode="fixed"` uses an offline-fitted `B`
-(`fit_influence_matrix.py`); `mode="rls"` refines it online with a forgetting-factor
-`RLSEstimator` and small dither. `probe_authority.py` and `measure_fault_deficit.py` compare the
-velocity a bounded offset can buy back against the measured post-fault deficit; those probes
-motivated moving on from pure offset correction.
+### 1. Residual correction (`adaptation.py`)
 
-**2. Gait-amplitude scaling (`amplitude_adapter.py`).** Instead of adding a correction, scale the
-policy's joint-action amplitude (`env._action_scale * s`), trading speed for stability.
-`probe_amplitude.py` measures the effect of fixed scales (0.70–1.30) per fault. Three modes:
+`ResidualAdapter` adds a bounded joint-space offset `delta` (|delta| ≤ `delta_max` per joint) to
+the policy's action. An integral controller drives smoothed body velocity toward the command
+through a ridge pseudo-inverse of an influence matrix `B` (action → forward/lateral/yaw velocity).
+`mode="fixed"` uses an offline `B` from `fit_influence_matrix.py` (archived per seed as
+`models/seed_N_influence.npz`); `mode="rls"` refines it online with a forgetting-factor
+`RLSEstimator`.
 
-- `none`: `s = 1` (Baseline A behaviour).
-- `fixed`: constant `s` (default 0.70).
-- `adaptive`: `s ∈ [0.5, 1.0]` driven by an online risk signal.
-
-The adaptive rule needs **no fault detector and no per-policy tuning**. It calibrates on the
-robot's own first 2 s of walking and sets the risk threshold to `mean + k·sd` of healthy risk.
-Risk is smoothed torso tilt (`1 − upright_alignment`) plus `osc_weight` × its short-window
-standard deviation (`risk_mode="osc"`), because delay-induced instability appears as oscillation
-before it appears as lean. When risk exceeds the threshold, `s` backs off, proportionally to the
-relative excess by default (`backoff_rule="proportional"`, or a fixed multiplicative `"step"`),
-and otherwise recovers additively by `increase` per step.
-
-**3. Is adaptation worth it? (`frontier_compare.py`, `eval_amplitude.py`).** The honest control for
-the adaptive controller is a *constant* reduced gait. `frontier_compare.py` sweeps fixed scales
-(1.0–0.5) and adaptive thresholds `k` on one fault, then reports the Pareto front on fall rate
-vs speed and says whether adaptive, fixed, or neither dominates. `eval_amplitude.py` runs
-`none`/`fixed`/`adaptive` on the five Baseline A faults with the same trial protocol and recovery
-criterion, writing `logs/amplitude_eval.csv`; `--severities` evaluates a range and `--all` loops
-over seeds. `sweep_adapter.py` grid-searches `risk_mode`, `k_threshold`, `increase`, and
-`smooth_window`.
+`probe_authority.py` and `measure_fault_deficit.py` ask how much speed a bounded constant offset can
+buy back. On seed 0 the best delivered forward correction is **0.055 m/s**, against the largest
+settled deficit from Baseline A (0.137 m/s, `joint_lock`): about **40% — partial, not
+insufficient**. `measure_fault_deficit.py` independently finds `torque_limit` and `joint_lock`
+52–56% correctable. A constant offset therefore cannot restore commanded speed, but it is not
+useless. Both probes originally compared against a 0.27 m/s worst *transient* dip, which overstated
+the target about 2.5×; they now use settled deficits from the 10-seed Baseline A. Replication on
+held-out seeds 1, 4, and 7 (chosen in advance) is pending:
 
 ```bash
-python scripts/probe_amplitude.py --model models/seed_0
-python scripts/sweep_adapter.py --model models/seed_0 --fault actuation_delay --severity 5
-python scripts/frontier_compare.py --model models/seed_0 --fault actuation_delay --severity 5
-python scripts/eval_amplitude.py --model models/seed_0 --trials 30
+python scripts/probe_authority.py --model models/seed_N
+python scripts/probe_amplitude.py --model models/seed_N --trials 12 --offset_authority <value from probe_authority>
 ```
 
-**Status and caveats.** Adapter defaults were tuned from a sweep on `seed_0` and
-`actuation_delay`, so evaluating them on that same seed and fault is in-sample; results on other
-seeds and faults are what count. No adaptation results are reported in this README yet. Run the
-scripts above and record them here. The held-out fault split (H3) should be settled before any
-held-out number is looked at.
+### 2. Gait-amplitude scaling (`amplitude_adapter.py`)
+
+Scale the policy's joint-action amplitude (`env._action_scale * s`), trading speed for stability.
+`probe_amplitude.py` measures fixed scales per fault. `AmplitudeAdapter` has three modes:
+`none` (`s = 1`), `fixed` (constant `s`), and `adaptive` (`s ∈ [0.5, 1.0]`).
+
+The adaptive rule needs no fault detector. It calibrates on the robot's own first 2 s of walking,
+sets a risk threshold at `mean + k·sd` of healthy risk, and treats smoothed torso tilt
+(`1 − upright_alignment`) plus `osc_weight` × its short-window standard deviation as risk. Above
+the threshold it backs off (proportionally to the excess by default); otherwise it recovers
+additively by `increase` per step. This is additive-increase / multiplicative-decrease (AIMD).
+
+### 3. Is adaptation worth it? Four comparisons, one answer
+
+| Script | Question | Finding |
+|---|---|---|
+| `frontier_compare.py` | At a *fixed* severity, does adaptive reach a better fall-rate/speed Pareto front than constant scales? | Severity 5: no adaptive point on the front. Severity 10: adaptive appears on the front only in a sampling gap between fixed scales; at n = 20 fixed 0.70–1.00 are statistically indistinguishable. Comparing one adaptive point to one constant (the earlier approach) was invalid because each mechanism has its own trade-off curve. |
+| `measure_latency.py` | Is the controller simply too slow to react? | **No.** Detection takes 0.6–1.1 s and reaching a safe scale about 1.3 s, with a budget of 2.5–6.5 s before the robot falls: roughly 10× the time needed. |
+| `deployment_compare.py` | With one configuration committed *before* a fault of unknown severity (2–20), does adaptive win? | Constants win. On seed 0 `fixed 0.80` has equal or lower falls and higher speed than every adaptive configuration, and every adaptive controller falls 100% at severity 20. |
+| `analyze_deployment.py` | Does that hold on policies it was not tuned on, under paired statistics? | Yes on seeds 1–9 (below). |
+
+**Why the controller loses.** It detects quickly and backs off correctly, then climbs back
+(`increase = 0.0015`) to a scale that falls about 60% of the time. AIMD assumes conditions improve;
+these faults are permanent, so the safe amplitude is permanently lower and any recovery is wrong
+by construction. Back-off-and-hold (`increase = 0`) also fails: the fault transient alone drives
+the scale to its floor at every severity, which is a fixed minimum with extra steps. `increase`
+trades conservatism for speed exactly as a fixed scale does. Three successive explanations for
+the controller's behaviour (sweep defaults, detection latency, back-off-and-hold) were each wrong
+and each caught by measurement.
+
+**Held-out result (seeds 1–9, `actuation_delay`, severities 2–20, 15 trials per cell).**
+The policy is the unit of analysis; tests are exact two-sided Wilcoxon signed-rank with Holm
+correction, and bootstrap 95% intervals resample policies. The confirmatory claim (`fixed 0.80`
+dominates every adaptive configuration) was fixed from the seed-0 tuning run *before* the
+held-out run; the family is 2 metrics × 3 configs = 6 tests.
+
+| Adaptive config | Speed gain of `fixed 0.80` | 95% CI | Holm adj. p | Fall difference | adj. p |
+|---|---|---|---|---|---|
+| k = 1.0 | +0.091 m/s | [+0.063, +0.117] | 0.023 | +0.4 pt | 1.00 |
+| k = 2.0 | +0.075 m/s | [+0.050, +0.102] | 0.023 | −0.8 pt | 1.00 |
+| k = 3.0 | +0.072 m/s | [+0.042, +0.097] | 0.031 | −1.6 pt | 0.56 |
+
+All three are dominated: `fixed 0.80` is faster, and no difference in falls was detected. The
+claim is that the constant is not shown to be safer, only not detectably riskier. The result is
+robust to excluding severity 20, which is saturated for every candidate on held-out policies.
+Exploratory only: `fixed 0.70` shows a 6–9 point fall advantage over every adaptive configuration
+with intervals excluding zero, which does not survive correction across the full family of 24
+comparisons (the smallest achievable exact p at n = 9, 0.0039, exceeds the corrected threshold).
+
+**Scope.** This establishes that AIMD on a tilt-oscillation signal does not beat a constant. It
+does not show that no adaptive method could. Directly estimating the delay, or a fault-conditioned
+policy, remain untested. A constant chosen to survive severity 10 is nearly immobile at severity 2
+(`fixed 0.55` manages about −0.04 m/s on seed 0), which is the remaining argument for adaptation.
+At severities 10 and 20 settled velocity is negative, meaning upright but drifting backward, which
+is not restored locomotion.
+
+```bash
+python scripts/frontier_compare.py --model models/seed_0 --fault actuation_delay --severity 5 \
+    --fixed_scales 0.5,0.55,0.6,0.65,0.7,0.75,0.8
+python scripts/measure_latency.py --model models/seed_0 --fault actuation_delay --severity 5
+python scripts/deployment_compare.py --model models/seed_0 --trials 15
+python scripts/deployment_compare.py --all --exclude 0 --trials 15     # held-out seeds
+python scripts/analyze_deployment.py --csv logs/deployment.csv --confirm "fixed 0.80"
+python scripts/eval_amplitude.py --model models/seed_0 --trials 30     # none / fixed / adaptive
+python scripts/sweep_adapter.py --model models/seed_0                  # hyperparameter grid
+```
+
+Outputs: `logs/frontier.csv`, `logs/deployment.csv`, `logs/amplitude_eval.csv`, `logs/sweep_seed0.csv`.
+`deployment_compare.py` runs 8 candidates (`none`, fixed 0.80/0.70/0.65/0.55, adaptive
+k = 1.0/2.0/3.0), each held unchanged across severities. `analyze_deployment.py` validates its
+own statistics against scipy and statsmodels reference implementations.
 
 ---
 
@@ -685,15 +737,14 @@ recovery-scoring helpers.
 
 Stated plainly because they determine what the next round of experiments has to address.
 
-1. **`actuation_delay` may be a floor effect.** 0% recovery on every seed and trial gives an
-   adaptation method maximum headroom but may not discriminate between methods either. Running
-   `--sweep` on one seed settles whether a milder lag is partially recoverable.
+1. **`actuation_delay` is saturated at severity 10.** It is a 97.7% fall rate on Baseline A and
+   100% for every candidate at severity 20, so it discriminates poorly between methods there.
+   Severities 2–5 are where methods can differ.
 
-2. **Systematic velocity overshoot.** Converged seeds average 0.585 m/s against a 0.5 m/s
-   command — 17% high, consistently, across all six. Because the gait check measures net
-   displacement while the reward tracks forward-axis velocity, these diverge if the robot drifts
-   laterally, and the reward contains no lateral or yaw penalty. `check_drift.py` resolves it;
-   the fix would require retraining.
+2. **Systematic velocity overshoot.** Seeds average 0.544 m/s against a 0.5 m/s command, about 9%
+   high. Because the gait check measures net displacement while the reward tracks forward-axis
+   velocity, these diverge if the robot drifts laterally, and the reward contains no lateral or
+   yaw penalty. `check_drift.py` resolves it; the fix would require retraining.
 
 3. **Weak velocity-tracking gradient.** Walking at target scores ≈ +0.97/step, undershooting by
    38% scores ≈ +0.80/step — an ~18% incentive gap, against a fall cost of −10 plus every
@@ -701,9 +752,9 @@ Stated plainly because they determine what the next round of experiments has to 
    track speed, which plausibly explains both the `off_target` failures and the speed spread. An
    exponential tracking reward (Rudin et al., 2022) would sharpen it while staying positive.
 
-4. **n = 6 converged seeds.** Workable, thin for a method comparison. The adaptation comparison
-   is paired (same base policies with and without adaptation), which recovers considerable
-   power, but more seeds would be better. Expect ~40% attrition when planning.
+4. **n = 10 seeds.** Enough for paired exact tests, but the smallest achievable exact Wilcoxon p
+   at n = 9 held-out policies is 0.0039, so large exploratory families cannot reach significance.
+   Fix the family before looking at results.
 
 5. **Random joint selection adds uncontrolled variance.** Per-joint faults draw a random joint
    each trial, so 100 trials spread across 12 joints is ~8 per joint. Whether a hip or a calf is
@@ -725,15 +776,20 @@ Stated plainly because they determine what the next round of experiments has to 
 9. **Single robot, flat terrain, simulation only.** No terrain variation, no domain
    randomization, no sim-to-real claim is being made.
 
-10. **Adapter tuned in-sample.** `AmplitudeAdapter` defaults came from a sweep on one seed and
-    fault. Treat those numbers as development results and re-evaluate on the remaining seeds.
+10. **Seed 0 is the tuning seed.** Adapter defaults came from sweeps on seed 0. Report held-out
+    results on seeds 1–9 (`--exclude 0`); the seed-0 numbers are development results.
 
-11. **Amplitude scaling is not residual adaptation.** The adaptive controller changes gait
-    amplitude, not a learned correction; it may win by simply walking more cautiously, which is
-    why `frontier_compare.py` pits it against constant scaling. It is a candidate mechanism, not
-    yet the residual module the hypotheses describe.
+11. **The adaptation evidence is mostly `actuation_delay`.** The deployment comparison and
+    frontier use one fault type. Constant amplitude reduction is shown to beat AIMD there; it has
+    not been tested on `torque_limit` or `joint_lock` under the same protocol.
 
-12. **`check_reset_pose.py` prints "expected ~0.30" for the reset height.** The correct settled
+12. **Amplitude scaling is not residual adaptation.** It changes gait amplitude, not a learned
+    correction. It is a baseline for the residual module, which is still to be built.
+
+13. **Offset-probe verdicts are seed-0 only.** The 40% partial-coverage figure needs replication
+    on seeds 1, 4, and 7.
+
+14. **`check_reset_pose.py` prints "expected ~0.30" for the reset height.** The correct settled
     standing height is ~0.558 m. The printed measurement is right; the parenthetical hint is
     stale.
 
@@ -745,9 +801,11 @@ Stated plainly because they determine what the next round of experiments has to 
 - [x] Seed training reproducibly and record provenance alongside every model.
 - [x] Screen seeds on velocity tracking, over multiple episodes.
 - [x] Exclude non-converged seeds from aggregation via the manifest.
-- [ ] Run `--sweep` on one seed to determine whether `actuation_delay` is saturated, then fix
-      final severities.
-- [ ] Run `check_drift.py` to establish whether the 0.585 m/s figure is forward velocity or
+- [x] Extend the Baseline A window to 700 steps and report settled deficits.
+- [x] Compare adaptive vs constant amplitude on frontiers, then under deployment conditions.
+- [x] Replicate the comparison on held-out seeds 1–9 with paired, corrected statistics.
+- [ ] Replicate `probe_authority.py` / `probe_amplitude.py` on seeds 1, 4, 7.
+- [ ] Run `check_drift.py` to establish whether the 0.544 m/s figure is forward velocity or
       includes lateral drift.
 - [ ] **Fix the held-out fault split for H3 and write down the reasoning — before the adaptation
       module exists.** Current candidate: train on `torque_limit`, `joint_lock`, `sensor_noise`;
@@ -757,9 +815,11 @@ Stated plainly because they determine what the next round of experiments has to 
 - [x] Prototype a residual (integral / RLS) correction and probe its authority.
 - [x] Prototype an adaptive gait-amplitude controller; add a fixed-scale control, tuning sweep,
       and Pareto-front comparison.
-- [ ] Run `frontier_compare.py` and `eval_amplitude.py --all`, and record the results here.
-- [ ] Decide the final adaptation mechanism (residual module on the `_apply_fault_to_action`
-      hook, amplitude scaling, or both) from the frontier results.
+- [ ] Test an adaptive method that is not AIMD: estimate the delay directly, or condition the
+      policy on the fault, and compare against constant amplitude on the same protocol.
+- [ ] Extend the constant-vs-adaptive comparison beyond `actuation_delay`.
+- [ ] Implement the residual module on the `_apply_fault_to_action` hook and compare it to the
+      constant-amplitude baseline.
 - [ ] Implement Baseline B (full policy retraining post-fault) for the upper-bound comparison.
 - [ ] Add a domain-randomization baseline — reviewers will ask why randomized training isn't
       sufficient on its own.
