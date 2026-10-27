@@ -1,0 +1,6 @@
+{
+  "timesteps": 1500000,
+  "n_envs": 4,
+  "ent_coef": 0.01,
+  "seed": 2
+}
