@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 
@@ -21,6 +22,26 @@ DC_OFFSET_AUTHORITY = 0.055
 
 # Settled post-fault velocity deficits the channel must close
 MEASURED_DEFICIT = {"torque_limit": 0.117, "joint_lock": 0.137, "actuation_delay": 0.197}
+
+
+def resolve_offset_authority(model_path, cli_value, default):
+    if cli_value is not None:
+        return float(cli_value), "--offset_authority"
+    path = model_path + "_authority.json"
+    if os.path.exists(path):
+        with open(path) as f:
+            rec = json.load(f)
+        zp = model_path + ".zip"
+        fp = rec.get("fingerprint")
+        if fp and os.path.exists(zp):
+            st = os.stat(zp)
+            if st.st_size != fp.get("size") or abs(st.st_mtime - fp.get("mtime", 0)) > 1.0:
+                print(f"WARNING: {path} was measured on a different version of this "
+                      f"model file (size/mtime mismatch). Ignoring it; re-run "
+                      f"probe_authority.py on this model.")
+                return float(default), "seed-0 default (sidecar stale)"
+        return float(rec["offset_authority_mps"]), path
+    return float(default), "seed-0 default (no sidecar found)"
 
 
 def rollout(model, env, seed, base_scale, scale=1.0, mode="joint",
@@ -95,9 +116,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/seed_0")
     parser.add_argument("--offset_authority", type=float, default=None,
-                        help="This policy's best constant-offset correction, from "
-                             "probe_authority.py on the SAME policy. Defaults to the "
-                             "seed-0 value.")
+                        help="Override this policy's constant-offset ceiling. Normally "
+                             "unnecessary: the value is read from the "
+                             "<model>_authority.json written by probe_authority.py.")
     parser.add_argument("--trials", type=int, default=12,
                         help="Seeds per (condition, scale). Paired across scales.")
     parser.add_argument("--no_randomize", action="store_true",
@@ -107,14 +128,16 @@ def main():
     args = parser.parse_args()
 
     global DC_OFFSET_AUTHORITY
-    if args.offset_authority is not None:
-        DC_OFFSET_AUTHORITY = args.offset_authority
-    else:
-        print(f"NOTE: comparing against the SEED-0 offset authority "
-              f"({DC_OFFSET_AUTHORITY} m/s). For a\n      held-out policy, pass its own "
-              f"value with --offset_authority.\n")
+    DC_OFFSET_AUTHORITY, source = resolve_offset_authority(
+        args.model, args.offset_authority, DC_OFFSET_AUTHORITY)
+    print(f"Offset authority for comparison: {DC_OFFSET_AUTHORITY:+.4f} m/s  ({source})")
+    if source.startswith("seed-0"):
+        print("  NOTE: this is not this policy's own value. Run probe_authority.py on "
+              "this model\n  first so the two channels are compared like-for-like.")
+    print()
 
     model = PPO.load(args.model)
+
     env = make_env_from_model_path(args.model, render=False,
                                    randomize_init=not args.no_randomize)
     base_scale = float(env._action_scale)
@@ -124,7 +147,7 @@ def main():
           f"{MEASURE_FROM}-{MEASURE_TO}, {args.trials} paired seeds each")
     print(f"  base joint action_scale = {base_scale}")
 
-    # ---- healthy: action-space vs joint-space ----
+    # healthy: action-space vs joint-space 
     print("\n" + "=" * 74)
     print("HEALTHY ROBOT")
     print("=" * 74)
@@ -151,7 +174,7 @@ def main():
         print_table(res, args.trials, f"{fname} (severity {fsev})")
     env.close()
 
-    # ---- verdict ----
+    # verdict 
     print("\n" + "=" * 74)
     print("AMPLITUDE vs OFFSET, judged against the measured deficits")
     print("=" * 74)
@@ -170,7 +193,8 @@ def main():
         c_best = max(gains, key=gains.get)
         g_best = gains[c_best]
         cover = g_best / deficit if deficit else float("nan")
-        vs_off = g_best / DC_OFFSET_AUTHORITY
+        vs_off = (g_best / DC_OFFSET_AUTHORITY if DC_OFFSET_AUTHORITY > 1e-3
+                  else float("nan"))
         speed_rows.append((fname, cover, g_best))
         print(f"  {label:<20}{deficit:>9.3f}{g_best:>+10.4f}{c_best:>7.2f}"
               f"{cover:>8.0%}{vs_off:>10.1f}x")

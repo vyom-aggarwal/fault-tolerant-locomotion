@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 
@@ -20,6 +21,23 @@ SETTLED_DEFICIT = {
     "sensor_dropout": 0.019,
     "sensor_noise": 0.009,
 }
+
+
+def model_fingerprint(model_path):
+    zp = model_path + ".zip"
+    if not os.path.exists(zp):
+        return None
+    st = os.stat(zp)
+    return {"size": st.st_size, "mtime": round(st.st_mtime, 3)}
+
+
+def write_authority_sidecar(model_path, record):
+    path = model_path + "_authority.json"
+    record = dict(record, model=os.path.basename(model_path),
+                  fingerprint=model_fingerprint(model_path))
+    with open(path, "w") as f:
+        json.dump(record, f, indent=2)
+    return path
 
 
 def ridge_pinv(Bm, lam=0.05):
@@ -237,7 +255,7 @@ def main():
         print("     the same as when healthy. The ceiling is a property of DC joint")
         print("     offsets, not an artefact of measuring on an intact policy.")
 
-    # ---- verdict ----
+    # verdict 
     print("\n" + "=" * 70)
     sufficient = max_delivered >= 0.6 * WORST_DROP
     partial = max_delivered >= 0.25 * WORST_DROP
@@ -290,6 +308,19 @@ def main():
         print("Try a larger --scale. If the robot falls instead of responding,")
         print("additive action offsets may be the wrong actuation channel entirely.")
     print("=" * 70)
+
+    out = write_authority_sidecar(args.model, {
+        "offset_authority_mps": round(float(max_delivered), 5),
+        "offset_authority_under_fault_mps": round(float(best_fault_gain), 5),
+        "largest_settled_deficit_mps": round(float(WORST_DROP), 5),
+        "fraction_of_deficit_healthy": round(float(max_delivered / WORST_DROP), 4),
+        "fraction_of_deficit_faulted": round(float(best_fault_gain / WORST_DROP), 4),
+        "forward_r2": round(float(r2[0]), 4),
+        "forward_split_half_cos": (round(float(cos[0]), 4) if cos is not None else None),
+        "episodes": int(args.episodes),
+        "offset_scale": float(args.scale),
+    })
+    print(f"\nWrote {out}  (read automatically by probe_amplitude.py)")
 
 
 if __name__ == "__main__":
