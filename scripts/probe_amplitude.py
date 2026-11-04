@@ -21,6 +21,8 @@ MAX_STEPS = 1000
 DC_OFFSET_AUTHORITY = 0.055
 
 # Settled post-fault velocity deficits the channel must close
+MIN_PAIRED = 4
+
 MEASURED_DEFICIT = {"torque_limit": 0.117, "joint_lock": 0.137, "actuation_delay": 0.197}
 
 
@@ -137,7 +139,6 @@ def main():
     print()
 
     model = PPO.load(args.model)
-
     env = make_env_from_model_path(args.model, render=False,
                                    randomize_init=not args.no_randomize)
     base_scale = float(env._action_scale)
@@ -162,7 +163,7 @@ def main():
         print("  High saturation: action-space scaling is largely clipped away, so")
         print("  joint-space scaling is the fair test of the amplitude channel.")
 
-    # under fault 
+    # ---- under fault ----
     print("\n" + "=" * 74)
     print("UNDER FAULT  (joint-space scaling)")
     print("=" * 74)
@@ -183,16 +184,19 @@ def main():
           f"{'covers':>9}{'vs offset':>11}")
     speed_rows = []
     for (fname, fsev), res in fault_results.items():
-        gains = {c: paired_gain(res, c)[0] for c in SCALES if c != 1.00}
-        gains = {c: g for c, g in gains.items() if g is not None}
+        pg = {c: paired_gain(res, c) for c in SCALES if c != 1.00}
+        gains = {c: g for c, (g, n) in pg.items() if g is not None and n >= MIN_PAIRED}
         deficit = MEASURED_DEFICIT.get(fname)
         label = f"{fname}({fsev})"
         if not gains:
-            print(f"  {label:<20}  (no surviving paired trials at any scale)")
+            best_n = max((n for _, n in pg.values()), default=0)
+            print(f"  {label:<20}  (fewer than {MIN_PAIRED} surviving pairs at every "
+                  f"scale; best {best_n} -- speed effect not estimable)")
             continue
         c_best = max(gains, key=gains.get)
         g_best = gains[c_best]
         cover = g_best / deficit if deficit else float("nan")
+        # The offset can deliver ~zero or even negative correction on some policies
         vs_off = (g_best / DC_OFFSET_AUTHORITY if DC_OFFSET_AUTHORITY > 1e-3
                   else float("nan"))
         speed_rows.append((fname, cover, g_best))

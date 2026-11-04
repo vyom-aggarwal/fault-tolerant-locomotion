@@ -102,6 +102,12 @@ def main():
                         help="Std of the per-joint constant offset.")
     parser.add_argument("--delta_max", type=float, default=0.30,
                         help="Per-joint bound on the correction, matching ResidualAdapter.")
+    parser.add_argument("--direct_trials", type=int, default=6,
+                        help="Initial conditions per requested correction in the direct "
+                             "test. Was 1 (a single fixed trajectory per level).")
+    parser.add_argument("--fault_trials", type=int, default=10,
+                        help="Paired trials per fault in the under-fault test. Was 4, "
+                             "with randomization off and falls not excluded.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -166,25 +172,48 @@ def main():
     if rel is not None:
         print(f"  split-half rel.diff = {rel:.3f}")
 
-    # direct authority test 
+    # direct authority test
     print("\n" + "-" * 70)
     print("DIRECT TEST: request a forward correction, measure what is delivered")
     print(f"  (delta bounded at +/-{args.delta_max} per joint, as in ResidualAdapter)")
-    env2 = make_env_from_model_path(args.model, render=False, randomize_init=False)
-    y_ref, _, _ = run_episode(model, env2, np.zeros(n_act), args.max_steps, seed=7)
-    print(f"\n  {'requested':>10}{'||delta||':>11}{'clipped':>9}{'delivered':>11}{'fraction':>10}")
+    # Randomized initial states and several paired trials per level
+    env2 = make_env_from_model_path(args.model, render=False, randomize_init=True)
+    dseeds = [2000 + k for k in range(args.direct_trials)]
+    refs = {}
+    for sd in dseeds:
+        y, _, fell = run_episode(model, env2, np.zeros(n_act), args.max_steps, seed=sd)
+        if y is not None and not fell:
+            refs[sd] = y
+    print(f"\n  {len(refs)}/{len(dseeds)} reference episodes survived; each requested "
+          f"correction is paired against them")
+    print(f"\n  {'requested':>10}{'||delta||':>11}{'clipped':>9}{'delivered':>11}"
+          f"{'sd':>8}{'n':>4}{'fell':>6}{'fraction':>10}")
     delivered_abs = []
     for target in (0.10, 0.20, 0.30):
         d = ridge_pinv(B) @ np.array([target, 0.0, 0.0])
         norm_raw = np.linalg.norm(d)
         d_cl = np.clip(d, -args.delta_max, args.delta_max)
         was_clipped = not np.allclose(d, d_cl)
-        y_new, _, _ = run_episode(model, env2, d_cl, args.max_steps, seed=7)
-        delivered = (y_new[0] - y_ref[0]) if y_new is not None else float("nan")
+        diffs, n_fell = [], 0
+        for sd in dseeds:
+            if sd not in refs:
+                continue
+            y_new, _, fell = run_episode(model, env2, d_cl, args.max_steps, seed=sd)
+            if fell or y_new is None:
+                n_fell += 1
+                continue
+            diffs.append(y_new[0] - refs[sd][0])
+        if diffs:
+            delivered = float(np.mean(diffs))
+            spread = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
+        else:
+            delivered, spread = float("nan"), float("nan")
         frac = delivered / target if target else float("nan")
         delivered_abs.append(delivered)
         print(f"  {target:>10.2f}{norm_raw:>11.3f}{str(was_clipped):>9}"
-              f"{delivered:>+11.4f}{frac:>9.0%}")
+              f"{delivered:>+11.4f}{spread:>8.4f}{len(diffs):>4}{n_fell:>6}{frac:>9.0%}")
+    env2.close()
+    # The reported ceiling is the MAXIMUM over requested levels, which biases it upward
     max_delivered = float(np.nanmax(delivered_abs)) if delivered_abs else 0.0
     env2.close()
     print("\n  Settled deficits to compensate (Baseline A, 10 seeds): "
@@ -198,44 +227,56 @@ def main():
 
     WORST_DROP = max(SETTLED_DEFICIT["torque_limit"], SETTLED_DEFICIT["joint_lock"])
 
-    # authority on a DAMAGED robot 
+    # authority on a DAMAGED robot
     print("\n" + "-" * 70)
     print("AUTHORITY UNDER FAULT (paired: same seed, same fault, delta on vs off)")
-    env3 = make_env_from_model_path(args.model, render=False, randomize_init=False)
+    # Randomization ON, more trials, and a pair counts toward the velocity gain only if NEITHER run fell
+    env3 = make_env_from_model_path(args.model, render=False, randomize_init=True)
     FSTEP, MEASURE = 150, 260
     faults = [("torque_limit", 0.2), ("joint_lock", 1.0), ("actuation_delay", 5)]
-    print(f"\n  {'fault':<17}{'sev':>6}{'v_fault':>10}{'v_+delta':>10}"
-          f"{'gain':>9}{'healthy':>9}")
+    print(f"\n  {'fault':<17}{'sev':>6}{'v_fault':>10}{'v_+delta':>10}{'gain':>9}"
+          f"{'n':>4}{'fell off':>10}{'fell on':>9}{'healthy':>9}")
     fault_gains = []
+    fault_rows = {}
     for fname, fsev in faults:
-        gains, n_ok = [], 0
-        for sd in range(4):
-            y0f, _, fell0 = run_episode(model, env3, np.zeros(n_act), args.max_steps,
-                                        seed=sd, fault=fname, fault_severity=fsev,
-                                        fault_step=FSTEP, offset_start=FSTEP,
-                                        measure_from=MEASURE)
-            if y0f is None:
-                continue
-            # ask for the shortfall the fault actually created
-            want = float(np.clip(args.scale * 0 + (y0[0] - y0f[0]), 0.05, 0.40))
-            d = ridge_pinv(B) @ np.array([want, 0.0, 0.0])
-            d = np.clip(d, -args.delta_max, args.delta_max)
-            y1f, _, fell1 = run_episode(model, env3, d, args.max_steps,
-                                        seed=sd, fault=fname, fault_severity=fsev,
-                                        fault_step=FSTEP, offset_start=FSTEP,
-                                        measure_from=MEASURE)
-            if y1f is None:
+        gains, fell_off, fell_on, attempted = [], 0, 0, 0
+        for k in range(args.fault_trials):
+            sd = 3000 + k
+            y0f, _, f0 = run_episode(model, env3, np.zeros(n_act), args.max_steps,
+                                     seed=sd, fault=fname, fault_severity=fsev,
+                                     fault_step=FSTEP, offset_start=FSTEP,
+                                     measure_from=MEASURE)
+            attempted += 1
+            fell_off += bool(f0)
+            # Request the shortfall the fault created on this trial
+            short = (y0[0] - y0f[0]) if (y0f is not None and not f0) else 0.05
+            want = float(np.clip(short, 0.05, 0.40))
+            d = np.clip(ridge_pinv(B) @ np.array([want, 0.0, 0.0]),
+                        -args.delta_max, args.delta_max)
+            y1f, _, f1 = run_episode(model, env3, d, args.max_steps,
+                                     seed=sd, fault=fname, fault_severity=fsev,
+                                     fault_step=FSTEP, offset_start=FSTEP,
+                                     measure_from=MEASURE)
+            fell_on += bool(f1)
+            if f0 or f1 or y0f is None or y1f is None:
                 continue
             gains.append((y0f[0], y1f[0], y1f[0] - y0f[0]))
-            n_ok += 1
+        fault_rows[fname] = {"n_pairs": len(gains), "attempted": attempted,
+                             "fell_off": fell_off, "fell_on": fell_on}
         if not gains:
-            print(f"  {fname:<17}{fsev:>6}   (all trials ended before measurement)")
+            print(f"  {fname:<17}{fsev:>6}   (no pair survived both runs; "
+                  f"fell off {fell_off}, on {fell_on} of {attempted})")
             continue
         g = np.array(gains)
-        fault_gains.append(g[:, 2].mean())
+        fault_gains.append(float(g[:, 2].mean()))
+        fault_rows[fname]["gain"] = round(float(g[:, 2].mean()), 5)
         print(f"  {fname:<17}{fsev:>6}{g[:,0].mean():>10.4f}{g[:,1].mean():>10.4f}"
-              f"{g[:,2].mean():>+9.4f}{max_delivered:>+9.4f}")
+              f"{g[:,2].mean():>+9.4f}{len(gains):>4}{fell_off:>7}/{attempted:<2}"
+              f"{fell_on:>6}/{attempted:<2}{max_delivered:>+9.4f}")
     env3.close()
+    print("\n  'fell off' / 'fell on': falls without and with the offset. Velocity")
+    print("  gain uses only pairs where neither run fell; a difference in fall")
+    print("  counts is reported separately rather than folded into speed.")
 
     best_fault_gain = max(fault_gains) if fault_gains else 0.0
     ratio = best_fault_gain / max_delivered if abs(max_delivered) > 1e-9 else float("inf")
@@ -318,6 +359,9 @@ def main():
         "forward_r2": round(float(r2[0]), 4),
         "forward_split_half_cos": (round(float(cos[0]), 4) if cos is not None else None),
         "episodes": int(args.episodes),
+        "direct_trials": int(args.direct_trials),
+        "fault_trials": int(args.fault_trials),
+        "under_fault": fault_rows,
         "offset_scale": float(args.scale),
     })
     print(f"\nWrote {out}  (read automatically by probe_amplitude.py)")
