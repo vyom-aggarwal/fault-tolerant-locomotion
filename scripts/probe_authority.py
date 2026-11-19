@@ -14,13 +14,26 @@ from envs.quadruped_env import make_env_from_model_path
 LABELS = ("forward", "lateral", "yaw")
 
 
-# Settled post-fault velocity deficits from the corrected Baseline A
 SETTLED_DEFICIT = {
     "torque_limit": 0.117,
     "joint_lock": 0.137,
     "sensor_dropout": 0.019,
     "sensor_noise": 0.009,
 }
+
+
+# Two-sided 95% Student-t critical values by degrees of freedom, to 5 decimals, each rounded UP so no interval is ever narrower than exact.
+_T975 = {1: 12.70621, 2: 4.30266, 3: 3.18245, 4: 2.77645, 5: 2.57059, 6: 2.44692, 7: 2.36463, 8: 2.30601, 9: 2.26216, 10: 2.22814, 11: 2.20099, 12: 2.17882, 13: 2.16037, 14: 2.14479, 15: 2.13145, 16: 2.11991, 17: 2.10982, 18: 2.10093, 19: 2.09303, 20: 2.08597, 21: 2.07962, 22: 2.07388, 23: 2.06866, 24: 2.06390, 25: 2.05954, 26: 2.05553, 27: 2.05184, 28: 2.04841, 29: 2.04523, 30: 2.04228, 40: 2.02108, 60: 2.00030, 120: 1.97994}
+MIN_PAIRS = 4   # an under-fault gain from fewer surviving pairs is not compared
+
+
+def t_interval(mean, sd, n):
+    if n < 2 or not np.isfinite(sd):
+        return float("nan"), float("nan")
+    df = n - 1
+    t = _T975[max(k for k in _T975 if k <= df)]
+    h = t * sd / np.sqrt(n)
+    return mean - h, mean + h
 
 
 def model_fingerprint(model_path):
@@ -112,6 +125,7 @@ def main():
     args = parser.parse_args()
 
     model = PPO.load(args.model)
+    # Randomization OFF here, deliberately, unlike the tests below
     env = make_env_from_model_path(args.model, render=False, randomize_init=False)
     rng = np.random.default_rng(args.seed)
     n_act = env.action_space.shape[0]
@@ -189,6 +203,7 @@ def main():
     print(f"\n  {'requested':>10}{'||delta||':>11}{'clipped':>9}{'delivered':>11}"
           f"{'sd':>8}{'n':>4}{'fell':>6}{'fraction':>10}")
     delivered_abs = []
+    level_stats = []          # (requested, mean, sd, n) per level
     for target in (0.10, 0.20, 0.30):
         d = ridge_pinv(B) @ np.array([target, 0.0, 0.0])
         norm_raw = np.linalg.norm(d)
@@ -210,10 +225,11 @@ def main():
             delivered, spread = float("nan"), float("nan")
         frac = delivered / target if target else float("nan")
         delivered_abs.append(delivered)
+        level_stats.append((target, delivered, spread, len(diffs)))
         print(f"  {target:>10.2f}{norm_raw:>11.3f}{str(was_clipped):>9}"
               f"{delivered:>+11.4f}{spread:>8.4f}{len(diffs):>4}{n_fell:>6}{frac:>9.0%}")
     env2.close()
-    # The reported ceiling is the MAXIMUM over requested levels, which biases it upward
+
     max_delivered = float(np.nanmax(delivered_abs)) if delivered_abs else 0.0
     env2.close()
     print("\n  Settled deficits to compensate (Baseline A, 10 seeds): "
@@ -227,16 +243,14 @@ def main():
 
     WORST_DROP = max(SETTLED_DEFICIT["torque_limit"], SETTLED_DEFICIT["joint_lock"])
 
-    # authority on a DAMAGED robot
+    # authority on a DAMAGED robot 
     print("\n" + "-" * 70)
     print("AUTHORITY UNDER FAULT (paired: same seed, same fault, delta on vs off)")
-    # Randomization ON, more trials, and a pair counts toward the velocity gain only if NEITHER run fell
     env3 = make_env_from_model_path(args.model, render=False, randomize_init=True)
     FSTEP, MEASURE = 150, 260
     faults = [("torque_limit", 0.2), ("joint_lock", 1.0), ("actuation_delay", 5)]
     print(f"\n  {'fault':<17}{'sev':>6}{'v_fault':>10}{'v_+delta':>10}{'gain':>9}"
           f"{'n':>4}{'fell off':>10}{'fell on':>9}{'healthy':>9}")
-    fault_gains = []
     fault_rows = {}
     for fname, fsev in faults:
         gains, fell_off, fell_on, attempted = [], 0, 0, 0
@@ -268,7 +282,6 @@ def main():
                   f"fell off {fell_off}, on {fell_on} of {attempted})")
             continue
         g = np.array(gains)
-        fault_gains.append(float(g[:, 2].mean()))
         fault_rows[fname]["gain"] = round(float(g[:, 2].mean()), 5)
         print(f"  {fname:<17}{fsev:>6}{g[:,0].mean():>10.4f}{g[:,1].mean():>10.4f}"
               f"{g[:,2].mean():>+9.4f}{len(gains):>4}{fell_off:>7}/{attempted:<2}"
@@ -278,84 +291,83 @@ def main():
     print("  gain uses only pairs where neither run fell; a difference in fall")
     print("  counts is reported separately rather than folded into speed.")
 
-    best_fault_gain = max(fault_gains) if fault_gains else 0.0
-    ratio = best_fault_gain / max_delivered if abs(max_delivered) > 1e-9 else float("inf")
-    print(f"\n  Best delivered correction under fault: {best_fault_gain:+.4f} m/s")
-    print(f"  vs healthy-robot measurement:          {max_delivered:+.4f} m/s "
-          f"({ratio:.1f}x)")
-    if best_fault_gain > 2.0 * max(max_delivered, 1e-9):
-        print("  -> Authority is substantially HIGHER under fault. The healthy-robot")
-        print("     measurement understated it because the intact policy cancels the")
-        print("     offset. Fit B on DAMAGED rollouts, or accept the nominal B as a")
-        print("     direction-only estimate and let integral action set the scale.")
-    elif best_fault_gain > 0.5 * WORST_DROP:
-        print("  -> Sufficient under fault even though it looked marginal when healthy.")
+    # healthy ceiling, with its uncertainty
+    valid = [ls for ls in level_stats if ls[3] > 0 and np.isfinite(ls[1])]
+    if valid:
+        req_c, max_delivered, sd_c, n_c = max(valid, key=lambda ls: ls[1])
+        ci_lo, ci_hi = t_interval(max_delivered, sd_c, n_c)
     else:
-        print(f"  -> Covers {best_fault_gain / WORST_DROP:.0%} of the largest settled "
-              f"deficit under fault, about")
-        print("     the same as when healthy. The ceiling is a property of DC joint")
-        print("     offsets, not an artefact of measuring on an intact policy.")
+        req_c, max_delivered, sd_c, n_c = float("nan"), 0.0, float("nan"), 0
+        ci_lo = ci_hi = float("nan")
+    by_req = {ls[0]: ls[1] for ls in level_stats}
+    growth = (by_req.get(0.30, float("nan")) - by_req.get(0.10, float("nan")))
 
-    # verdict 
+    # under fault: compare against the healthy INTERVAL, not a ratio
+    estimable = {k: v for k, v in fault_rows.items()
+                 if v.get("n_pairs", 0) >= MIN_PAIRS and "gain" in v}
+    best_fault_gain = max((v["gain"] for v in estimable.values()), default=float("nan"))
+    print(f"\n  Best under-fault gain with >= {MIN_PAIRS} surviving pairs: "
+          + (f"{best_fault_gain:+.4f} m/s" if np.isfinite(best_fault_gain) else "none"))
+    print(f"  Healthy ceiling: {max_delivered:+.4f} m/s, "
+          f"95% CI [{ci_lo:+.4f}, {ci_hi:+.4f}]")
+    if not np.isfinite(best_fault_gain):
+        fault_vs_healthy = "not estimable"
+    elif not np.isfinite(ci_lo):
+        fault_vs_healthy = "healthy interval unavailable"
+    elif best_fault_gain > ci_hi:
+        fault_vs_healthy = "above the healthy interval"
+    elif best_fault_gain < ci_lo:
+        fault_vs_healthy = "below the healthy interval"
+    else:
+        fault_vs_healthy = "within the healthy interval"
+    print(f"  -> Under-fault gain is {fault_vs_healthy}.")
+    print("     Caveat: under fault each trial requests its own shortfall, while the")
+    print("     healthy ceiling comes from requests up to 0.30 m/s. The comparison is")
+    print("     like-for-like only where delivered correction saturates well below")
+    print("     both request sizes.")
+
+    # verdict: descriptive, interval-based, scoped 
+    D = WORST_DROP
     print("\n" + "=" * 70)
-    sufficient = max_delivered >= 0.6 * WORST_DROP
-    partial = max_delivered >= 0.25 * WORST_DROP
-
-    fwd_ok = (cos is not None and cos[0] > 0.7 and r2[0] > 0.4)
-    fwd_weak = (cos is not None and cos[0] > 0.35 and r2[0] > 0.2)
-    others_ok = (cos is not None and cos[1] > 0.6 and cos[2] > 0.6)
-    print(f"Best delivered forward correction: {max_delivered:+.4f} m/s "
-          f"({max_delivered/WORST_DROP:.0%} of the largest settled deficit, "
-          f"{WORST_DROP:.3f} m/s)\n")
-
-    if not sufficient and not partial:
-        print("INSUFFICIENT AUTHORITY. Even at the delta bound, a constant joint")
-        print("offset moves forward velocity far less than the faults remove it.")
-        print("Identification quality is beside the point: no achievable delta")
-        print("restores commanded speed. The residual must act on a channel that")
-        print("reaches gait timing or amplitude, not joint posture.")
-    elif not sufficient:
-        print("PARTIAL AUTHORITY. The correction moves forward velocity in the")
-        print("right direction but cannot fully undo the larger faults. Expect")
-        print("recovery on mild faults and partial recovery on severe ones --")
-        print("which is a reportable result, not a failure, provided it is framed")
-        print("as a bound on what this parameterisation can do.")
-    elif fwd_weak and not fwd_ok:
-        print("SUFFICIENT AUTHORITY, WEAKLY IDENTIFIED.")
-        print("The achievable correction covers the fault-induced drop, but the")
-        print("forward row of B is noisy. Improve identification (more episodes,")
-        print("larger dither) before running the evaluation.")
-        print("The forward row is positive and explains real variance, so this is")
-        print("not a missing control channel -- it is a poorly identified and")
-        print("low-gain one. Whether that is sufficient is answered by the direct")
-        print("test above, not by these correlations: compare the delivered")
-        print("correction against the fault-induced velocity drops.")
-    elif fwd_ok:
-        print("AUTHORITY CONFIRMED and well identified for forward velocity.")
-        print("Averaging over whole episodes resolves the response, so the earlier")
-        print("failure was signal-to-noise, not a missing control channel.")
-        print("Fix identification: raise --dither and --steps in")
-        print("fit_influence_matrix.py, or widen its smoothing window.")
-    elif others_ok:
-        print("STRUCTURAL LIMIT: lateral and yaw respond to a constant offset;")
-        print("forward velocity does not, even averaged over whole episodes.")
-        print("A DC joint offset changes posture, and forward speed is set by")
-        print("stride frequency and length -- properties of the limit cycle that")
-        print("a constant offset does not reach. More data will not fix this.")
-        print("The residual parameterisation needs a channel that affects gait")
-        print("timing or amplitude, not just posture.")
+    print(f"Delivered forward correction (best level, requested {req_c:.2f}): "
+          f"{max_delivered:+.4f} m/s")
+    print(f"  95% CI [{ci_lo:+.4f}, {ci_hi:+.4f}] m/s  =  "
+          f"[{ci_lo/D:.0%}, {ci_hi/D:.0%}] of the largest settled deficit ({D:.3f} m/s)")
+    if not np.isfinite(ci_hi):
+        closes = "cannot be assessed (no usable interval)"
+    elif ci_hi < D:
+        closes = f"does NOT close the settled deficit (upper 95% bound {ci_hi/D:.0%})"
+    elif ci_lo >= D:
+        closes = "closes the settled deficit"
     else:
-        print("NO CLEAR AUTHORITY on any output at this offset scale.")
-        print("Try a larger --scale. If the robot falls instead of responding,")
-        print("additive action offsets may be the wrong actuation channel entirely.")
+        closes = "cannot be determined at this n -- the interval spans the full deficit"
+    print(f"  -> {closes}")
+    if np.isfinite(ci_lo) and ci_lo <= 0:
+        print("  -> and is not distinguishable from zero")
+    print(f"  Tripling the request (0.10 -> 0.30) changed the delivered correction "
+          f"by {growth:+.4f} m/s, against +0.20 requested.")
+    fc = cos[0] if cos is not None else float("nan")
+    print(f"\n  Scope: this is the offset a residual method would apply using the")
+    print(f"  identified influence matrix B (forward split-half cosine {fc:.2f}). It is")
+    print(f"  not an upper bound on every constant offset, and a non-scaling response")
+    print(f"  cannot by itself distinguish the policy cancelling the offset from B")
+    print(f"  pointing it in a poor direction.")
     print("=" * 70)
 
     out = write_authority_sidecar(args.model, {
         "offset_authority_mps": round(float(max_delivered), 5),
-        "offset_authority_under_fault_mps": round(float(best_fault_gain), 5),
+        "offset_authority_under_fault_mps": (round(float(best_fault_gain), 5)
+                                             if np.isfinite(best_fault_gain) else None),
         "largest_settled_deficit_mps": round(float(WORST_DROP), 5),
         "fraction_of_deficit_healthy": round(float(max_delivered / WORST_DROP), 4),
-        "fraction_of_deficit_faulted": round(float(best_fault_gain / WORST_DROP), 4),
+        "fraction_of_deficit_faulted": (round(float(best_fault_gain / WORST_DROP), 4)
+                                        if np.isfinite(best_fault_gain) else None),
+        "offset_authority_ci95_mps": [round(float(ci_lo), 5), round(float(ci_hi), 5)],
+        "delivered_by_request": {f"{ls[0]:.2f}": {"mean": round(float(ls[1]), 5),
+                                                  "sd": round(float(ls[2]), 5),
+                                                  "n": int(ls[3])} for ls in level_stats},
+        "growth_when_request_tripled_mps": round(float(growth), 5),
+        "under_fault_vs_healthy": fault_vs_healthy,
         "forward_r2": round(float(r2[0]), 4),
         "forward_split_half_cos": (round(float(cos[0]), 4) if cos is not None else None),
         "episodes": int(args.episodes),

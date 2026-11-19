@@ -17,10 +17,10 @@ CHANGE_STEP = 150
 MEASURE_FROM = 300
 MEASURE_TO = 800
 MAX_STEPS = 1000
-# Best forward change a constant joint offset delivered, as measured by probe_authority.py ON SEED 0
+# Best forward change a constant joint offset delivered, as measured by probe_authority.py on seed 0
 DC_OFFSET_AUTHORITY = 0.055
+OFFSET_RATIO_OK = True
 
-# Settled post-fault velocity deficits the channel must close
 MIN_PAIRED = 4
 
 MEASURED_DEFICIT = {"torque_limit": 0.117, "joint_lock": 0.137, "actuation_delay": 0.197}
@@ -28,7 +28,7 @@ MEASURED_DEFICIT = {"torque_limit": 0.117, "joint_lock": 0.137, "actuation_delay
 
 def resolve_offset_authority(model_path, cli_value, default):
     if cli_value is not None:
-        return float(cli_value), "--offset_authority"
+        return float(cli_value), "--offset_authority", None
     path = model_path + "_authority.json"
     if os.path.exists(path):
         with open(path) as f:
@@ -41,9 +41,10 @@ def resolve_offset_authority(model_path, cli_value, default):
                 print(f"WARNING: {path} was measured on a different version of this "
                       f"model file (size/mtime mismatch). Ignoring it; re-run "
                       f"probe_authority.py on this model.")
-                return float(default), "seed-0 default (sidecar stale)"
-        return float(rec["offset_authority_mps"]), path
-    return float(default), "seed-0 default (no sidecar found)"
+                return float(default), "seed-0 default (sidecar stale)", None
+        ci = rec.get("offset_authority_ci95_mps")
+        return float(rec["offset_authority_mps"]), path, (tuple(ci) if ci else None)
+    return float(default), "seed-0 default (no sidecar found)", None
 
 
 def rollout(model, env, seed, base_scale, scale=1.0, mode="joint",
@@ -129,16 +130,23 @@ def main():
                              "identical trials, so n is effectively 1.")
     args = parser.parse_args()
 
-    global DC_OFFSET_AUTHORITY
-    DC_OFFSET_AUTHORITY, source = resolve_offset_authority(
+    global DC_OFFSET_AUTHORITY, OFFSET_RATIO_OK
+    DC_OFFSET_AUTHORITY, source, ci = resolve_offset_authority(
         args.model, args.offset_authority, DC_OFFSET_AUTHORITY)
     print(f"Offset authority for comparison: {DC_OFFSET_AUTHORITY:+.4f} m/s  ({source})")
+    # A ratio against an offset ceiling that cannot be distinguished from zero is meaningless
+    OFFSET_RATIO_OK = DC_OFFSET_AUTHORITY >= 0.02 and (ci is None or ci[0] > 0)
+    if ci is not None:
+        print(f"  95% CI [{ci[0]:+.4f}, {ci[1]:+.4f}] m/s"
+              + ("" if OFFSET_RATIO_OK else
+                 "  -- not distinguishable from zero; 'vs offset' ratios suppressed"))
     if source.startswith("seed-0"):
         print("  NOTE: this is not this policy's own value. Run probe_authority.py on "
               "this model\n  first so the two channels are compared like-for-like.")
     print()
 
     model = PPO.load(args.model)
+
     env = make_env_from_model_path(args.model, render=False,
                                    randomize_init=not args.no_randomize)
     base_scale = float(env._action_scale)
@@ -163,7 +171,7 @@ def main():
         print("  High saturation: action-space scaling is largely clipped away, so")
         print("  joint-space scaling is the fair test of the amplitude channel.")
 
-    # ---- under fault ----
+    # under fault 
     print("\n" + "=" * 74)
     print("UNDER FAULT  (joint-space scaling)")
     print("=" * 74)
@@ -196,9 +204,8 @@ def main():
         c_best = max(gains, key=gains.get)
         g_best = gains[c_best]
         cover = g_best / deficit if deficit else float("nan")
-        # The offset can deliver ~zero or even negative correction on some policies
-        vs_off = (g_best / DC_OFFSET_AUTHORITY if DC_OFFSET_AUTHORITY > 1e-3
-                  else float("nan"))
+        # The offset can deliver ~zero or even negative correction on some policies; a ratio against that is meaningless, not infinite.
+        vs_off = g_best / DC_OFFSET_AUTHORITY if OFFSET_RATIO_OK else float("nan")
         speed_rows.append((fname, cover, g_best))
         print(f"  {label:<20}{deficit:>9.3f}{g_best:>+10.4f}{c_best:>7.2f}"
               f"{cover:>8.0%}{vs_off:>10.1f}x")
